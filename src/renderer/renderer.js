@@ -110,9 +110,7 @@ const elements = {
   tileSetImageInput: document.querySelector('#tileSetImageInput'),
   tileColorPicker: document.querySelector('#tileColorPicker'),
   collapseLeftPanelsButton: document.querySelector('#collapseLeftPanelsButton'),
-  expandLeftPanelsButton: document.querySelector('#expandLeftPanelsButton'),
   collapseRightPanelsButton: document.querySelector('#collapseRightPanelsButton'),
-  expandRightPanelsButton: document.querySelector('#expandRightPanelsButton'),
   projectsPath: document.querySelector('#projectsPath'),
   editorProjectName: document.querySelector('#editorProjectName'),
   editorSaveState: document.querySelector('#editorSaveState'),
@@ -4734,7 +4732,37 @@ function resizeViewport() {
 function setSidebarCollapsed(side, isCollapsed) {
   const className = side === 'left' ? 'left-panels-collapsed' : 'right-panels-collapsed';
   elements.editorView.classList.toggle(className, isCollapsed);
+  updatePanelToolButtons();
   window.requestAnimationFrame(resizeViewport);
+}
+
+function isSidebarCollapsed(side) {
+  const className = side === 'left' ? 'left-panels-collapsed' : 'right-panels-collapsed';
+  return elements.editorView.classList.contains(className);
+}
+
+function updatePanelToolButton(button, isCollapsed, labels) {
+  const label = isCollapsed ? labels.show : labels.hide;
+
+  button.setAttribute('aria-label', label);
+  button.setAttribute('title', label);
+  button.setAttribute('aria-pressed', String(isCollapsed));
+  button.classList.toggle('tool-active', isCollapsed);
+}
+
+function updatePanelToolButtons() {
+  updatePanelToolButton(elements.collapseLeftPanelsButton, isSidebarCollapsed('left'), {
+    hide: 'Minimizar propriedades',
+    show: 'Mostrar propriedades'
+  });
+  updatePanelToolButton(elements.collapseRightPanelsButton, isSidebarCollapsed('right'), {
+    hide: 'Minimizar painéis da cena',
+    show: 'Mostrar painéis da cena'
+  });
+}
+
+function toggleSidebarCollapsed(side) {
+  setSidebarCollapsed(side, !isSidebarCollapsed(side));
 }
 
 elements.newProjectButton.addEventListener('click', openNewProjectModal);
@@ -4856,10 +4884,9 @@ elements.tileSetImageInput.addEventListener('change', async () => {
     elements.tileSetImageInput.value = '';
   }
 });
-elements.collapseLeftPanelsButton.addEventListener('click', () => setSidebarCollapsed('left', true));
-elements.expandLeftPanelsButton.addEventListener('click', () => setSidebarCollapsed('left', false));
-elements.collapseRightPanelsButton.addEventListener('click', () => setSidebarCollapsed('right', true));
-elements.expandRightPanelsButton.addEventListener('click', () => setSidebarCollapsed('right', false));
+elements.collapseLeftPanelsButton.addEventListener('click', () => toggleSidebarCollapsed('left'));
+elements.collapseRightPanelsButton.addEventListener('click', () => toggleSidebarCollapsed('right'));
+updatePanelToolButtons();
 elements.undoButton.addEventListener('click', undoEditorAction);
 elements.redoButton.addEventListener('click', redoEditorAction);
 elements.objectTree.addEventListener('contextmenu', openOutlinerContextMenu);
