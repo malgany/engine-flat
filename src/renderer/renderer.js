@@ -4743,11 +4743,12 @@ function isSidebarCollapsed(side) {
 
 function updatePanelToolButton(button, isCollapsed, labels) {
   const label = isCollapsed ? labels.show : labels.hide;
+  const isVisible = !isCollapsed;
 
   button.setAttribute('aria-label', label);
   button.setAttribute('title', label);
-  button.setAttribute('aria-pressed', String(isCollapsed));
-  button.classList.toggle('tool-active', isCollapsed);
+  button.setAttribute('aria-pressed', String(isVisible));
+  button.classList.toggle('panel-visible', isVisible);
 }
 
 function updatePanelToolButtons() {
