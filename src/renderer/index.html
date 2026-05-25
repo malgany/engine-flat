@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Engine Flat</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true" focusable="false">
+      <symbol id="icon-add" viewBox="0 0 24 24"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"></path></symbol>
+      <symbol id="icon-folder-open" viewBox="0 0 24 24"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5V10h-2V8.5a.5.5 0 0 0-.5-.5h-7.33l-2-2H5.5a.5.5 0 0 0-.5.5V18l2.2-6.16A2 2 0 0 1 9.08 10H21l-2.46 6.88A3 3 0 0 1 15.72 19H5.5A2.5 2.5 0 0 1 3 16.5v-10Zm5.08 7.02L6.83 17h8.89a1 1 0 0 0 .94-.66L18.21 12H9.08l-1 1.52Z"></path></symbol>
+      <symbol id="icon-home" viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9.5Zm2 .95V19h2v-6h8v6h2v-7.55l-6-4.87-6 4.87Z"></path></symbol>
+      <symbol id="icon-projects" viewBox="0 0 24 24"><path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm0 2v12h14V6H5Zm2 2h5v4H7V8Zm7 0h3v2h-3V8Zm0 4h3v2h-3v-2ZM7 14h10v2H7v-2Z"></path></symbol>
+      <symbol id="icon-model" viewBox="0 0 24 24"><path d="m12 2 8 4.5v9L12 20l-8-4.5v-9L12 2Zm0 2.3L7.04 7.1 12 9.9l4.96-2.8L12 4.3ZM6 8.8v5.53l5 2.81v-5.53L6 8.8Zm7 8.34 5-2.81V8.8l-5 2.81v5.53Z"></path></symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 1 0 7.75 10h-2.1A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h8V3l-3.35 3.35Z"></path></symbol>
+      <symbol id="icon-undo" viewBox="0 0 24 24"><path d="M7.83 7H14a6 6 0 1 1 0 12H8v-2h6a4 4 0 1 0 0-8H7.83l3.58 3.59L10 14 4 8l6-6 1.41 1.41L7.83 7Z"></path></symbol>
+      <symbol id="icon-redo" viewBox="0 0 24 24"><path d="M16.17 7H10a6 6 0 1 0 0 12h6v-2h-6a4 4 0 1 1 0-8h6.17l-3.58 3.59L14 14l6-6-6-6-1.41 1.41L16.17 7Z"></path></symbol>
+      <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65-2-3.46-2.49 1a7.2 7.2 0 0 0-1.69-.98L15 3h-4l-.36 2.93c-.6.23-1.16.56-1.69.98l-2.49-1-2 3.46 2.11 1.65c-.04.32-.07.65-.07.98s.02.66.07.98l-2.11 1.65 2 3.46 2.49-1c.52.4 1.08.73 1.69.98L11 21h4l.36-2.93c.6-.23 1.16-.56 1.69-.98l2.49 1 2-3.46-2.11-1.65ZM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5Z"></path></symbol>
+      <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-11ZM5.5 6a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-9a.5.5 0 0 0-.5-.5h-7.33l-2-2H5.5Z"></path></symbol>
+      <symbol id="icon-save" viewBox="0 0 24 24"><path d="M5 3h12l2 2v16H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm0 2v14h14V6.2L16.8 5H16v5H7V5H5Zm4 0v3h5V5H9Zm-1 9h8v4H8v-4Z"></path></symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24"><path d="M11 4h2v8.17l3.59-3.58L18 10l-6 6-6-6 1.41-1.41L11 12.17V4Zm-6 14h14v2H5v-2Z"></path></symbol>
+      <symbol id="icon-more-vert" viewBox="0 0 24 24"><path d="M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"></path></symbol>
+      <symbol id="icon-edit" viewBox="0 0 24 24"><path d="M4 17.25V20h2.75L17.81 8.94l-2.75-2.75L4 17.25ZM19.71 7.04a1 1 0 0 0 0-1.41l-1.34-1.34a1 1 0 0 0-1.41 0l-1.05 1.05 2.75 2.75 1.05-1.05Z"></path></symbol>
+      <symbol id="icon-delete" viewBox="0 0 24 24"><path d="M8 4h8l1 2h4v2H3V6h4l1-2Zm1 6h2v8H9v-8Zm4 0h2v8h-2v-8Zm4 0h2v10a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V10h2v10h10V10Z"></path></symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24"><path d="m9 16.2-3.5-3.5-1.4 1.4L9 19 20.3 7.7l-1.4-1.4L9 16.2Z"></path></symbol>
+      <symbol id="icon-chevron-right" viewBox="0 0 24 24"><path d="m9.29 6.71 1.42-1.42L17.41 12l-6.7 6.71-1.42-1.42L14.59 12 9.29 6.71Z"></path></symbol>
+      <symbol id="icon-panel-left" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5Zm2 0v14h4V5H6Zm6 0v14h6V5h-6Z"></path></symbol>
+      <symbol id="icon-panel-right" viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5Zm2 0v14h6V5H6Zm8 0v14h4V5h-4Z"></path></symbol>
+      <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M12 5c5 0 9 5.2 9 7s-4 7-9 7-9-5.2-9-7 4-7 9-7Zm0 2c-3.63 0-6.74 3.54-7.83 5C5.26 13.46 8.37 17 12 17s6.74-3.54 7.83-5C18.74 10.54 15.63 7 12 7Zm0 2.25A2.75 2.75 0 1 1 12 14.75 2.75 2.75 0 0 1 12 9.25Z"></path></symbol>
+      <symbol id="icon-eye-off" viewBox="0 0 24 24"><path d="m3.28 2 18.73 18.73-1.28 1.28-3.08-3.08A9.54 9.54 0 0 1 12 21c-5 0-9-5.2-9-7 0-1.02 1.29-2.94 3.29-4.53L2 5.28 3.28 2Zm4.44 8.9C6.08 12.05 5.02 13.38 4.3 14c1.09 1.46 4.07 5 7.7 5 1.55 0 3.01-.65 4.28-1.54l-2.05-2.05A2.75 2.75 0 0 1 8.59 9.77l-.87-.87ZM12 7c5 0 9 5.2 9 7 0 .62-.48 1.62-1.3 2.68l-1.44-1.44c.61-.55 1.1-1.04 1.44-1.24-1.09-1.46-4.07-5-7.7-5-.61 0-1.2.1-1.78.28L8.66 7.72A9.33 9.33 0 0 1 12 7Z"></path></symbol>
+      <symbol id="icon-lock-open" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 9.58-2h-2.34A3 3 0 0 0 9 7v3h9a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h1Zm-1 2v7h12v-7H6Zm5 2h2v3h-2v-3Z"></path></symbol>
+      <symbol id="icon-lock" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3h1a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h1Zm2 0h6V7a3 3 0 0 0-6 0v3Zm-3 2v7h12v-7H6Zm5 2h2v3h-2v-3Z"></path></symbol>
+      <symbol id="icon-stamp" viewBox="0 0 24 24"><path d="M9 3h6v5.1A4 4 0 0 1 17 11.55V14h1.5A2.5 2.5 0 0 1 21 16.5V20H3v-3.5A2.5 2.5 0 0 1 5.5 14H7v-2.45A4 4 0 0 1 9 8.1V3Zm2 2v4.39l-.65.26A2 2 0 0 0 9 11.55V14h6v-2.45a2 2 0 0 0-1.35-1.9L13 9.39V5h-2Zm-5.5 11a.5.5 0 0 0-.5.5V18h14v-1.5a.5.5 0 0 0-.5-.5h-13Z"></path></symbol>
+      <symbol id="icon-fill" viewBox="0 0 24 24"><path d="m13.1 2.9 8 8a3 3 0 0 1 0 4.24l-4.95 4.95a3 3 0 0 1-4.24 0L4.8 12.98a3 3 0 0 1 0-4.24l5.48-5.84a2 2 0 0 1 2.82 0ZM6.22 10.15a1 1 0 0 0 0 1.42l7.1 7.1a1 1 0 0 0 1.42 0l4.95-4.95a1 1 0 0 0 0-1.41l-7.1-7.1-6.37 4.94ZM3 21h18v2H3v-2Z"></path></symbol>
+      <symbol id="icon-tile" viewBox="0 0 24 24"><path d="M4 5h16v14H4V5Zm2 2v10h12V7H6Zm2 2h8v6H8V9Z"></path></symbol>
+      <symbol id="icon-select" viewBox="0 0 24 24"><path d="M5 2.75 18.75 16.5l-6.2.72 3.08 5.33-1.9 1.1-3.08-5.33-4.1 4.58L5 2.75Zm2.35 5.03.8 10.08 2.86-3.2 4.32-.5-7.98-6.38Z"></path></symbol>
+      <symbol id="icon-move" viewBox="0 0 24 24"><path d="m12 2 4 4h-3v5h5V8l4 4-4 4v-3h-5v5h3l-4 4-4-4h3v-5H6v3l-4-4 4-4v3h5V6H8l4-4Z"></path></symbol>
+      <symbol id="icon-rotate" viewBox="0 0 24 24"><path d="M12 4a8 8 0 0 1 7.75 6H22l-3.5 4L15 10h2.67A6 6 0 1 0 12 18v2a8 8 0 0 1 0-16Z"></path></symbol>
+      <symbol id="icon-scale" viewBox="0 0 24 24"><path d="M14 4h6v6h-2V7.41l-6.29 6.3-1.42-1.42 6.3-6.29H14V4ZM4 14h6v6H4v-6Zm2 2v2h2v-2H6Z"></path></symbol>
+      <symbol id="icon-cube" viewBox="0 0 24 24"><path d="m12 2 8 4.5v9L12 20l-8-4.5v-9L12 2Zm0 2.3L7.04 7.1 12 9.9l4.96-2.8L12 4.3ZM6 8.8v5.53l5 2.81v-5.53L6 8.8Zm7 8.34 5-2.81V8.8l-5 2.81v5.53Z"></path></symbol>
+      <symbol id="icon-camera" viewBox="0 0 24 24"><path d="M4 6h3l1.5-2h7L17 6h3a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2Zm8 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm0 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z"></path></symbol>
+      <symbol id="icon-light" viewBox="0 0 24 24"><path d="M11 2h2v3h-2V2Zm7.66 3.93 1.41 1.41-2.12 2.12-1.41-1.41 2.12-2.12ZM4.93 7.34l1.41-1.41 2.12 2.12-1.41 1.41-2.12-2.12ZM12 7a5 5 0 0 1 3 9v3H9v-3a5 5 0 0 1 3-9Zm-3 14h6v1H9v-1ZM2 13h3v-2H2v2Zm17 0h3v-2h-3v2Z"></path></symbol>
+    </svg>
+
+    <div class="app-shell">
+      <section class="home-view" id="homeView">
+        <header class="top-app-bar">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true">EF</div>
+            <div>
+              <h1>Engine Flat</h1>
+              <p>Projetos 3D</p>
+            </div>
+          </div>
+          <div class="top-actions" aria-label="Ações principais">
+            <button class="icon-button" id="refreshButton" type="button" aria-label="Atualizar recentes" title="Atualizar recentes">
+              <svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>
+            </button>
+            <button class="icon-button" id="settingsButton" type="button" aria-label="Configurações" title="Configurações">
+              <svg class="icon" aria-hidden="true"><use href="#icon-settings"></use></svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="workspace">
+          <aside class="sidebar" aria-label="Navegação inicial">
+            <div class="primary-actions">
+              <button class="button button-filled" id="newProjectButton" type="button">
+                <svg class="icon button-icon" aria-hidden="true"><use href="#icon-add"></use></svg>
+                Novo projeto
+              </button>
+              <button class="button button-tonal" id="openProjectButton" type="button">
+                <svg class="icon button-icon" aria-hidden="true"><use href="#icon-folder-open"></use></svg>
+                Abrir projeto
+              </button>
+            </div>
+
+            <nav class="nav-list">
+              <button class="nav-item nav-item-active" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#icon-home"></use></svg>
+                Início
+              </button>
+              <button class="nav-item" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#icon-projects"></use></svg>
+                Projetos
+              </button>
+              <button class="nav-item" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#icon-model"></use></svg>
+                Modelos
+              </button>
+            </nav>
+
+            <div class="sidebar-footer">
+              <p>Pasta padrão</p>
+              <code id="projectsPath">projects</code>
+            </div>
+          </aside>
+
+          <main class="content">
+            <section class="page-heading" aria-labelledby="recentTitle">
+              <div>
+                <p class="eyebrow">Início</p>
+                <h2 id="recentTitle">Recentes</h2>
+              </div>
+              <button class="button button-outlined" id="showFolderButton" type="button">
+                <svg class="icon button-icon" aria-hidden="true"><use href="#icon-folder"></use></svg>
+                Pasta de projetos
+              </button>
+            </section>
+
+            <section class="recent-panel" aria-live="polite">
+              <div class="section-toolbar">
+                <div>
+                  <h3>Últimos projetos</h3>
+                  <p>Ordenados pelo uso mais recente.</p>
+                </div>
+                <div class="status-pill" id="projectCount">0 projetos</div>
+              </div>
+
+              <div class="recent-grid" id="recentGrid"></div>
+              <div class="empty-state" id="emptyState" hidden>
+                <div class="empty-visual" aria-hidden="true"><span></span><span></span><span></span></div>
+                <h3>Nenhum projeto recente</h3>
+                <p>Crie o primeiro projeto para gerar uma pasta local em <code>projects</code>.</p>
+                <button class="button button-filled" id="emptyNewProjectButton" type="button">
+                  <svg class="icon button-icon" aria-hidden="true"><use href="#icon-add"></use></svg>
+                  Novo projeto
+                </button>
+              </div>
+            </section>
+          </main>
+        </div>
+      </section>
+
+      <section class="editor-view" id="editorView" hidden>
+        <header class="editor-titlebar">
+          <div class="editor-title-left">
+            <button class="icon-button compact" id="backHomeButton" type="button" aria-label="Voltar para recentes" title="Voltar para recentes">
+              <svg class="icon" aria-hidden="true"><use href="#icon-home"></use></svg>
+            </button>
+            <strong id="editorProjectName">Projeto sem título</strong>
+            <span id="editorSaveState">Salvo</span>
+          </div>
+          <div class="editor-title-actions">
+            <button class="button button-outlined editor-export-button" id="editorExportButton" type="button">
+              <svg class="icon button-icon" aria-hidden="true"><use href="#icon-download"></use></svg>
+              Exportar
+            </button>
+            <button class="button button-tonal editor-save-button" id="editorSaveButton" type="button">
+              <svg class="icon button-icon" aria-hidden="true"><use href="#icon-save"></use></svg>
+              Salvar
+            </button>
+          </div>
+        </header>
+
+        <div class="editor-tool-toolbar" aria-label="Ferramentas do editor">
+          <div class="editor-tool-group editor-tool-primary">
+            <button class="editor-tool-button" id="undoButton" type="button" aria-label="Desfazer" title="Desfazer (Ctrl+Z)" disabled>
+              <svg class="icon" aria-hidden="true"><use href="#icon-undo"></use></svg>
+            </button>
+            <button class="editor-tool-button" id="redoButton" type="button" aria-label="Refazer" title="Refazer (Ctrl+Y)" disabled>
+              <svg class="icon" aria-hidden="true"><use href="#icon-redo"></use></svg>
+            </button>
+            <span class="editor-tool-separator" aria-hidden="true"></span>
+            <button class="editor-tool-button" id="stampToolButton" type="button" aria-label="Carimbo de tile" title="Carimbo de tile">
+              <svg class="icon" aria-hidden="true"><use href="#icon-stamp"></use></svg>
+            </button>
+            <button class="editor-tool-button" id="bucketToolButton" type="button" aria-label="Balde de tinta" title="Balde de tinta">
+              <svg class="icon" aria-hidden="true"><use href="#icon-fill"></use></svg>
+            </button>
+          </div>
+          <div class="editor-tool-group editor-panel-tools" aria-label="Painéis">
+            <button class="editor-tool-button" id="collapseLeftPanelsButton" type="button" aria-label="Minimizar propriedades" title="Minimizar propriedades">
+              <svg class="icon" aria-hidden="true"><use href="#icon-panel-left"></use></svg>
+            </button>
+            <button class="editor-tool-button" id="collapseRightPanelsButton" type="button" aria-label="Minimizar painéis da cena" title="Minimizar painéis da cena">
+              <svg class="icon" aria-hidden="true"><use href="#icon-panel-right"></use></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="editor-grid">
+          <aside class="left-panels">
+            <button class="sidebar-restore-button left-restore" id="expandLeftPanelsButton" type="button" aria-label="Mostrar propriedades" title="Mostrar propriedades">
+              <svg class="icon" aria-hidden="true"><use href="#icon-panel-left"></use></svg>
+            </button>
+            <section class="panel properties-panel">
+              <div class="panel-header">
+                <h3>Propriedades</h3>
+                <div class="panel-header-actions">
+                  <span id="selectedObjectName">Luz</span>
+                </div>
+              </div>
+              <div id="propertyFields">
+                <label>Localização X (m) <input type="number" value="0.000" step="0.01"></label>
+                <label>Localização Y (m) <input type="number" value="4.000" min="0" step="0.01"></label>
+                <label>Localização Z (m) <input type="number" value="3.000" step="0.01"></label>
+                <label>Rotação X (deg) <input type="number" value="0.000" step="0.1"></label>
+                <label>Rotação Y (deg) <input type="number" value="0.000" step="0.1"></label>
+                <label>Rotação Z (deg) <input type="number" value="0.000" step="0.1"></label>
+                <label>Escala <input type="number" value="1.000" min="0.01" step="0.01"></label>
+              </div>
+            </section>
+          </aside>
+
+          <main class="viewport-panel" aria-label="Viewport 3D">
+            <canvas id="sceneViewport" aria-label="Cena 3D"></canvas>
+            <div class="viewport-tool-palette" aria-label="Ferramentas de transformação">
+              <button class="viewport-tool-button tool-active" id="viewportSelectToolButton" type="button" aria-label="Selecionar" title="Selecionar">
+                <svg class="icon" aria-hidden="true"><use href="#icon-select"></use></svg>
+              </button>
+              <button class="viewport-tool-button" id="viewportMoveToolButton" type="button" aria-label="Mover" title="Mover">
+                <svg class="icon" aria-hidden="true"><use href="#icon-move"></use></svg>
+              </button>
+              <button class="viewport-tool-button" id="viewportRotateToolButton" type="button" aria-label="Rotacionar" title="Rotacionar">
+                <svg class="icon" aria-hidden="true"><use href="#icon-rotate"></use></svg>
+              </button>
+              <button class="viewport-tool-button" id="viewportScaleToolButton" type="button" aria-label="Escalar" title="Escalar">
+                <svg class="icon" aria-hidden="true"><use href="#icon-scale"></use></svg>
+              </button>
+            </div>
+            <div class="viewport-overlay">
+              <strong>Perspectiva do usuário</strong>
+              <span id="viewportProjectLabel">Cena 3D inicial sem objeto.</span>
+            </div>
+            <div class="axis-gizmo" id="axisGizmo" aria-label="Orientação da cena">
+              <div class="axis-gizmo-disc" aria-hidden="true"></div>
+              <span class="axis-gizmo-line axis-x" data-axis-line="x"></span>
+              <span class="axis-gizmo-line axis-y" data-axis-line="y"></span>
+              <span class="axis-gizmo-line axis-z" data-axis-line="z"></span>
+              <button class="axis-gizmo-point axis-x" data-axis="x" data-sign="1" type="button" aria-label="Ver +X">X</button>
+              <button class="axis-gizmo-point axis-y" data-axis="y" data-sign="1" type="button" aria-label="Ver +Y">Y</button>
+              <button class="axis-gizmo-point axis-z" data-axis="z" data-sign="1" type="button" aria-label="Ver +Z">Z</button>
+              <button class="axis-gizmo-point axis-negative axis-x" data-axis="x" data-sign="-1" type="button" aria-label="Ver -X">-X</button>
+              <button class="axis-gizmo-point axis-negative axis-y" data-axis="y" data-sign="-1" type="button" aria-label="Ver -Y">-Y</button>
+              <button class="axis-gizmo-point axis-negative axis-z" data-axis="z" data-sign="-1" type="button" aria-label="Ver -Z">-Z</button>
+            </div>
+          </main>
+
+          <aside class="right-panels">
+            <button class="sidebar-restore-button right-restore" id="expandRightPanelsButton" type="button" aria-label="Mostrar painéis da cena" title="Mostrar painéis da cena">
+              <svg class="icon" aria-hidden="true"><use href="#icon-panel-right"></use></svg>
+            </button>
+            <section class="panel outliner-panel">
+              <div class="panel-header">
+                <h3>Coleção da cena</h3>
+              </div>
+              <ul class="object-tree" id="objectTree" tabindex="0" aria-label="Coleção da cena">
+                <li class="selected" data-object-id="scene-light"><svg class="icon" aria-hidden="true"><use href="#icon-light"></use></svg>Luz</li>
+              </ul>
+            </section>
+
+            <section class="panel object-add-panel">
+              <div class="panel-header"><h3>Adicionar objeto</h3></div>
+              <div class="object-add-grid" aria-label="Tipos de objeto">
+                <button id="addTileButton" type="button">Tile</button>
+                <button type="button" disabled>Plano</button>
+                <button type="button" disabled>Esfera</button>
+                <button type="button" disabled>Importar</button>
+              </div>
+            </section>
+
+            <section class="panel tile-style-panel">
+              <div class="panel-header"><h3>TileSet</h3><span id="tileStyleName">Cores</span></div>
+              <div class="tileset-panel">
+                <div class="tileset-tabbar" id="tileSetTabs" role="tablist" aria-label="TileSets"></div>
+                <div class="tileset-content" id="tileSetContent"></div>
+                <input class="tile-color-picker" id="tileColorPicker" type="color" aria-label="Escolher cor personalizada">
+                <input class="tileset-image-input" id="tileSetImageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Importar imagem de tileset">
+              </div>
+            </section>
+          </aside>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-scrim" id="newProjectModal" hidden>
+      <form class="project-dialog" id="newProjectForm">
+        <h2>Novo projeto</h2>
+        <p>Escolha um nome para identificar o projeto nos recentes.</p>
+        <label for="projectNameInput">Nome do projeto</label>
+        <input id="projectNameInput" name="projectName" type="text" maxlength="80" placeholder="Projeto sem título">
+        <label for="tileSizeInput">Tamanho do quadrado em pixels</label>
+        <input id="tileSizeInput" name="tileSize" type="number" min="5" max="1000" step="1" value="100">
+        <div class="dialog-actions">
+          <button class="button button-text" id="cancelNewProjectButton" type="button">Cancelar</button>
+          <button class="button button-filled" type="submit">Criar e abrir</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="modal-scrim" id="renameProjectModal" hidden>
+      <form class="project-dialog" id="renameProjectForm">
+        <h2>Renomear projeto</h2>
+        <p>Defina um novo nome para este projeto.</p>
+        <label for="renameProjectNameInput">Nome do projeto</label>
+        <input id="renameProjectNameInput" name="projectName" type="text" maxlength="80" placeholder="Projeto sem título">
+        <div class="dialog-actions">
+          <button class="button button-text" id="cancelRenameProjectButton" type="button">Cancelar</button>
+          <button class="button button-filled" type="submit">Renomear</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="modal-scrim" id="deleteProjectModal" hidden>
+      <form class="project-dialog" id="deleteProjectForm">
+        <h2>Excluir projeto</h2>
+        <p id="deleteProjectMessage">Deseja mesmo excluir este projeto?</p>
+        <div class="dialog-actions">
+          <button class="button button-text" id="cancelDeleteProjectButton" type="button">Cancelar</button>
+          <button class="button button-filled button-danger" type="submit">Excluir</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="snackbar" id="snackbar" role="status" aria-live="polite"></div>
+    <div class="outliner-context-menu" id="outlinerContextMenu" hidden></div>
+
+    <script src="./browser-api.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "../../node_modules/three/build/three.module.js",
+          "three/addons/": "../../node_modules/three/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="./renderer.js"></script>
+  </body>
+</html>

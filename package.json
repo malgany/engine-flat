@@ -1,0 +1,25 @@
+{
+  "name": "engine-flat",
+  "version": "0.1.0",
+  "description": "MVP de ferramenta Electron para criar e organizar projetos de jogos 3D.",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "web": "node scripts/web-preview.js"
+  },
+  "keywords": [
+    "electron",
+    "game-editor",
+    "3d"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true,
+  "devDependencies": {
+    "electron": "^42.2.0"
+  },
+  "dependencies": {
+    "three": "^0.184.0"
+  }
+}
