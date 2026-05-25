@@ -9,6 +9,7 @@ const state = {
   activeCardMenuProjectId: null,
   renameProject: null,
   deleteProject: null,
+  deleteTileset: null,
   history: {
     undoStack: [],
     redoStack: [],
@@ -28,7 +29,8 @@ const state = {
   pendingTilesetImportId: null,
   customColorTargetIndex: null,
   activeTool: 'select',
-  viewportTool: 'select'
+  viewportTool: 'select',
+  roundingControlMode: 'edge'
 };
 
 const viewport = {
@@ -44,6 +46,13 @@ const viewport = {
   imageCache: new Map(),
   sceneLight: null,
   lightMarker: null,
+  axisGizmoRenderer: null,
+  axisGizmoScene: null,
+  axisGizmoCamera: null,
+  axisGizmoRoot: null,
+  axisGizmoTargets: [],
+  axisGizmoRaycaster: new THREE.Raycaster(),
+  axisGizmoPointer: new THREE.Vector2(),
   bucketPreviewGroup: null,
   transformHandleGroup: null,
   transformHandleTargets: [],
@@ -60,6 +69,8 @@ const viewportInteraction = {
   resizeDrag: null,
   moveDrag: null,
   rotateDrag: null,
+  roundDrag: null,
+  groupResizeDrag: null,
   selectionClick: null
 };
 
@@ -72,9 +83,19 @@ const tileVisualHeightUnits = 0.02;
 const gridHalfCellCount = 10;
 const viewportClickMoveTolerance = 6;
 const maxHistoryEntries = 120;
+const projectThumbnailWidthPixels = 320;
+const projectThumbnailHeightPixels = 180;
+const projectThumbnailQuality = 0.72;
 const defaultTileColor = '#9aa0a6';
 const defaultTilesetId = 'colors';
+const roundingControlModes = new Set(['edge', 'axis', 'all']);
+const roundingHandleMinPercent = 0;
+const roundingHandleMaxPercent = 100;
+const roundingGeometrySegments = 14;
 const tilePaletteColors = createDefaultTilePalette();
+const roundingEdgeDefinitions = createRoundingEdgeDefinitions();
+const roundingEdgeIds = roundingEdgeDefinitions.map((edge) => edge.id);
+let roundingModeMenuCloseTimer = null;
 
 const elements = {
   homeView: document.querySelector('#homeView'),
@@ -99,6 +120,11 @@ const elements = {
   viewportMoveToolButton: document.querySelector('#viewportMoveToolButton'),
   viewportRotateToolButton: document.querySelector('#viewportRotateToolButton'),
   viewportScaleToolButton: document.querySelector('#viewportScaleToolButton'),
+  viewportRoundToolItem: document.querySelector('#viewportRoundToolItem'),
+  viewportRoundToolButton: document.querySelector('#viewportRoundToolButton'),
+  viewportRoundModeMenu: document.querySelector('#viewportRoundModeMenu'),
+  viewportRoundModeButtons: [...document.querySelectorAll('[data-rounding-mode]')],
+  axisGizmoCanvas: document.querySelector('#axisGizmoCanvas'),
   stampToolButton: document.querySelector('#stampToolButton'),
   bucketToolButton: document.querySelector('#bucketToolButton'),
   addTileButton: document.querySelector('#addTileButton'),
@@ -130,6 +156,10 @@ const elements = {
   deleteProjectForm: document.querySelector('#deleteProjectForm'),
   deleteProjectMessage: document.querySelector('#deleteProjectMessage'),
   cancelDeleteProjectButton: document.querySelector('#cancelDeleteProjectButton'),
+  deleteTilesetModal: document.querySelector('#deleteTilesetModal'),
+  deleteTilesetForm: document.querySelector('#deleteTilesetForm'),
+  deleteTilesetMessage: document.querySelector('#deleteTilesetMessage'),
+  cancelDeleteTilesetButton: document.querySelector('#cancelDeleteTilesetButton'),
   outlinerContextMenu: document.querySelector('#outlinerContextMenu')
 };
 
@@ -255,6 +285,141 @@ function createDefaultTilePalette() {
   return [...neutralColors, ...colorFamilies, defaultTileColor];
 }
 
+function createRoundingEdgeDefinitions() {
+  const groups = [
+    {
+      axis: 'x',
+      label: 'Bordas X',
+      fixedAxes: ['y', 'z'],
+      labels: {
+        y: { 1: 'Y+', [-1]: 'Y-' },
+        z: { 1: 'Z+', [-1]: 'Z-' }
+      }
+    },
+    {
+      axis: 'y',
+      label: 'Bordas Y',
+      fixedAxes: ['x', 'z'],
+      labels: {
+        x: { 1: 'X+', [-1]: 'X-' },
+        z: { 1: 'Z+', [-1]: 'Z-' }
+      }
+    },
+    {
+      axis: 'z',
+      label: 'Bordas Z',
+      fixedAxes: ['x', 'y'],
+      labels: {
+        x: { 1: 'X+', [-1]: 'X-' },
+        y: { 1: 'Y+', [-1]: 'Y-' }
+      }
+    }
+  ];
+
+  return groups.flatMap((group) => {
+    const [firstAxis, secondAxis] = group.fixedAxes;
+
+    return [1, -1].flatMap((firstSign) => [1, -1].map((secondSign) => ({
+      id: `${group.axis}_${firstAxis}_${firstSign > 0 ? 'pos' : 'neg'}_${secondAxis}_${secondSign > 0 ? 'pos' : 'neg'}`,
+      axis: group.axis,
+      groupLabel: group.label,
+      label: `${group.labels[firstAxis][firstSign]} ${group.labels[secondAxis][secondSign]}`,
+      fixedAxes: [
+        { axis: firstAxis, sign: firstSign },
+        { axis: secondAxis, sign: secondSign }
+      ]
+    })));
+  });
+}
+
+function clampRoundingPercent(value) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return 0;
+  }
+
+  return Math.min(roundingHandleMaxPercent, Math.max(roundingHandleMinPercent, numericValue));
+}
+
+function normalizeTileRounding(rounding = {}) {
+  const sourceEdges = rounding.edges || {};
+  const edges = {};
+
+  roundingEdgeIds.forEach((edgeId) => {
+    edges[edgeId] = clampRoundingPercent(sourceEdges[edgeId]);
+  });
+
+  return { edges };
+}
+
+function cloneTileRounding(rounding) {
+  return cloneJson(normalizeTileRounding(rounding));
+}
+
+function getRoundingEdgeValue(rounding, edgeId) {
+  return clampRoundingPercent(normalizeTileRounding(rounding).edges[edgeId]);
+}
+
+function setRoundingEdgeValue(rounding, edgeId, value) {
+  const normalizedRounding = normalizeTileRounding(rounding);
+
+  if (roundingEdgeIds.includes(edgeId)) {
+    normalizedRounding.edges[edgeId] = clampRoundingPercent(value);
+  }
+
+  return normalizedRounding;
+}
+
+function setRoundingEdgeValues(rounding, edgeIds, value) {
+  const normalizedRounding = normalizeTileRounding(rounding);
+  const nextValue = clampRoundingPercent(value);
+
+  edgeIds.forEach((edgeId) => {
+    if (roundingEdgeIds.includes(edgeId)) {
+      normalizedRounding.edges[edgeId] = nextValue;
+    }
+  });
+
+  return normalizedRounding;
+}
+
+function setAllRoundingEdges(value) {
+  const edges = {};
+  const nextValue = clampRoundingPercent(value);
+
+  roundingEdgeIds.forEach((edgeId) => {
+    edges[edgeId] = nextValue;
+  });
+
+  return { edges };
+}
+
+function getRoundingAveragePercent(rounding) {
+  const normalizedRounding = normalizeTileRounding(rounding);
+  const total = roundingEdgeIds.reduce((sum, edgeId) => sum + normalizedRounding.edges[edgeId], 0);
+
+  return total / roundingEdgeIds.length;
+}
+
+function getRoundingEdgesAveragePercent(rounding, edgeIds = roundingEdgeIds) {
+  const normalizedRounding = normalizeTileRounding(rounding);
+  const validEdgeIds = edgeIds.filter((edgeId) => roundingEdgeIds.includes(edgeId));
+
+  if (validEdgeIds.length === 0) {
+    return 0;
+  }
+
+  const total = validEdgeIds.reduce((sum, edgeId) => sum + normalizedRounding.edges[edgeId], 0);
+
+  return total / validEdgeIds.length;
+}
+
+function hasTileRounding(rounding) {
+  const normalizedRounding = normalizeTileRounding(rounding);
+  return roundingEdgeIds.some((edgeId) => normalizedRounding.edges[edgeId] > 0);
+}
+
 function createDefaultLightObject() {
   return {
     id: 'scene-light',
@@ -312,6 +477,7 @@ function normalizeSceneObject(object, tileSizePixels) {
       heightPixels
     },
     material: normalizeTileMaterial(object.material),
+    rounding: normalizeTileRounding(object.rounding),
     resizeSnap: object.resizeSnap !== false,
     moveSnap: object.moveSnap !== false,
     rotateSnap: object.rotateSnap !== false
@@ -353,6 +519,14 @@ function normalizeProject(project) {
       name: group.name || `Grupo ${index + 1}`,
       visible: group.visible !== false,
       locked: group.locked === true,
+      transform: {
+        position: group.transform?.position || [0, 0, 0],
+        rotation: group.transform?.rotation || [0, 0, 0],
+        scale: group.transform?.scale || [1, 1, 1]
+      },
+      moveSnap: group.moveSnap !== false,
+      rotateSnap: group.rotateSnap !== false,
+      resizeSnap: group.resizeSnap !== false,
       objectIds: Array.isArray(group.objectIds)
         ? group.objectIds.filter((objectId) => objectIds.has(objectId))
         : []
@@ -663,6 +837,18 @@ function closeDeleteProjectModal() {
   elements.deleteProjectModal.hidden = true;
 }
 
+function openDeleteTilesetModal(tileset) {
+  state.deleteTileset = tileset;
+  elements.deleteTilesetMessage.textContent = `Deseja mesmo remover "${tileset.name}"? Os tiles que usam este TileSet voltam para a cor padrao.`;
+  elements.deleteTilesetModal.hidden = false;
+  window.setTimeout(() => elements.cancelDeleteTilesetButton.focus(), 0);
+}
+
+function closeDeleteTilesetModal() {
+  state.deleteTileset = null;
+  elements.deleteTilesetModal.hidden = true;
+}
+
 function getSceneObjects() {
   return state.activeProject?.scene?.objects || [];
 }
@@ -701,6 +887,22 @@ function getSceneGroups() {
     : [];
 
   return state.activeProject.scene.groups;
+}
+
+function getGroupById(groupId) {
+  return getSceneGroups().find((group) => group.id === groupId) || null;
+}
+
+function getSelectedGroup() {
+  return state.selectedGroupId ? getGroupById(state.selectedGroupId) : null;
+}
+
+function getGroupObjects(group) {
+  if (!group) {
+    return [];
+  }
+
+  return group.objectIds.map((objectId) => getObjectById(objectId)).filter(Boolean);
 }
 
 function getObjectById(objectId) {
@@ -906,16 +1108,117 @@ function createNumericProperty(label, propertyKey, value, options = {}) {
   const precision = options.precision ?? 3;
   const unitLabel = options.unit ? ` (${options.unit})` : '';
   const minAttribute = options.min === undefined ? '' : ` min="${options.min}"`;
+  const maxAttribute = options.max === undefined ? '' : ` max="${options.max}"`;
   const stepAttribute = options.step === undefined ? '' : ` step="${options.step}"`;
+  const disabledAttribute = options.disabled ? ' disabled aria-disabled="true"' : '';
 
-  return `<label>${label}${unitLabel} <input type="number" inputmode="decimal" data-property-key="${propertyKey}" value="${formatPropertyNumber(value, precision)}"${minAttribute}${stepAttribute}></label>`;
+  return `<label>${label}${unitLabel} <input type="number" inputmode="decimal" data-property-key="${propertyKey}" value="${formatPropertyNumber(value, precision)}"${minAttribute}${maxAttribute}${stepAttribute}${disabledAttribute}></label>`;
+}
+
+function createToggleProperty(label, attributeName, isChecked, isDisabled = false) {
+  const checkedAttribute = isChecked ? ' checked' : '';
+  const disabledAttribute = isDisabled ? ' disabled aria-disabled="true"' : '';
+
+  return `<label class="property-toggle">${label} <input type="checkbox" ${attributeName}${checkedAttribute}${disabledAttribute}></label>`;
 }
 
 function createPropertyDivider() {
   return '<div class="property-divider" role="separator" aria-hidden="true"></div>';
 }
 
+function createRoundingProperties(tile, isDisabled = false) {
+  const rounding = normalizeTileRounding(tile.rounding);
+  const properties = [
+    '<div class="property-section-title">Arredondamento</div>',
+    createNumericProperty('Todas as bordas', 'rounding-all', getRoundingAveragePercent(rounding), {
+      precision: 0,
+      min: 0,
+      max: 100,
+      step: 1,
+      unit: '%',
+      disabled: isDisabled
+    })
+  ];
+
+  ['Bordas X', 'Bordas Y', 'Bordas Z'].forEach((groupLabel) => {
+    properties.push(`<div class="property-subsection-title">${groupLabel}</div>`);
+    roundingEdgeDefinitions
+      .filter((edge) => edge.groupLabel === groupLabel)
+      .forEach((edge) => {
+        properties.push(createNumericProperty(edge.label, `rounding-edge-${edge.id}`, rounding.edges[edge.id], {
+          precision: 0,
+          min: 0,
+          max: 100,
+          step: 1,
+          unit: '%',
+          disabled: isDisabled
+        }));
+      });
+  });
+
+  return properties;
+}
+
+function getGroupScale(group) {
+  const numericScale = Number(group?.transform?.scale?.[0]);
+  return Number.isFinite(numericScale) && numericScale > 0 ? numericScale : 1;
+}
+
+function getGroupTransformBounds(group) {
+  const objectBounds = getGroupObjects(group).map((object) => getSelectedTransformBounds(object));
+
+  if (objectBounds.length === 0) {
+    const position = group?.transform?.position || [0, 0, 0];
+
+    return {
+      center: new THREE.Vector3(position[0], position[1], position[2]),
+      half: new THREE.Vector3(0.5, 0.5, 0.5),
+      radius: 0.7
+    };
+  }
+
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+
+  objectBounds.forEach((bounds) => {
+    min.min(bounds.center.clone().sub(bounds.half));
+    max.max(bounds.center.clone().add(bounds.half));
+  });
+
+  const center = min.clone().add(max).multiplyScalar(0.5);
+  const half = max.clone().sub(min).multiplyScalar(0.5);
+  const radius = Math.max(half.x * 2, half.y * 2, half.z * 2, 1) * 0.68;
+
+  return { center, half, radius };
+}
+
+function getGroupDimensionPixels(group, bounds = getGroupTransformBounds(group)) {
+  const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
+  const widthUnits = bounds.half.x * 2;
+  const heightUnits = bounds.half.y * 2;
+  const depthUnits = bounds.half.z * 2;
+
+  return {
+    tileSizePixels,
+    originPixels: [
+      (bounds.center.x - bounds.half.x) * tileSizePixels,
+      (bounds.center.y - bounds.half.y) * tileSizePixels,
+      (bounds.center.z - bounds.half.z) * tileSizePixels
+    ],
+    widthPixels: Math.max(tileSizePixels, Math.round(widthUnits * tileSizePixels)),
+    depthPixels: Math.max(tileSizePixels, Math.round(depthUnits * tileSizePixels)),
+    heightPixels: getTileHeightPixelsFromUnits(heightUnits, tileSizePixels)
+  };
+}
+
 function renderPropertiesPanel() {
+  const selectedGroup = getSelectedGroup();
+
+  if (selectedGroup) {
+    renderGroupPropertiesPanel(selectedGroup);
+    return;
+  }
+
   const selectedObject = getSelectedObject();
 
   if (!selectedObject) {
@@ -925,6 +1228,7 @@ function renderPropertiesPanel() {
   }
 
   elements.selectedObjectName.textContent = selectedObject.name;
+  const isLocked = isObjectEffectivelyLocked(selectedObject);
 
   const position = selectedObject.transform?.position || [0, 0, 0];
   const rotation = selectedObject.transform?.rotation || [0, 0, 0];
@@ -966,6 +1270,8 @@ function renderPropertiesPanel() {
       createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01 }),
       `<label class="property-toggle">Transformação magnética <input type="checkbox" data-tile-resize-snap ${selectedObject.resizeSnap !== false ? 'checked' : ''}></label>`,
       createPropertyDivider(),
+      ...createRoundingProperties(selectedObject, isLocked),
+      createPropertyDivider(),
       `<div class="property-note"><span>Célula</span><span>${gridPosition[0]}, ${gridPosition[1]}</span></div>`,
       `<div class="property-note"><span>Quadrado</span><span>${tileSizePixels} x ${tileSizePixels} px</span></div>`
     );
@@ -987,9 +1293,72 @@ function renderPropertiesPanel() {
   }
 
   elements.propertyFields.innerHTML = properties.join('');
+
+  if (isLocked) {
+    setPropertiesDisabled('Objeto bloqueado. Desbloqueie o cadeado para editar propriedades e transformações.');
+  }
+}
+
+function setPropertiesDisabled(message) {
+  const lockedNote = document.createElement('div');
+  lockedNote.className = 'property-locked';
+  lockedNote.textContent = message;
+  elements.propertyFields.prepend(lockedNote);
+  elements.propertyFields.querySelectorAll('input, button').forEach((control) => {
+    control.disabled = true;
+    control.setAttribute('aria-disabled', 'true');
+  });
+}
+
+function renderGroupPropertiesPanel(group) {
+  const groupObjects = getGroupObjects(group);
+  const bounds = getGroupTransformBounds(group);
+  const groupMetrics = getGroupDimensionPixels(group, bounds);
+  const rotation = group.transform?.rotation || [0, 0, 0];
+  const scale = group.transform?.scale || [1, 1, 1];
+  const isLocked = getGroupLocked(group);
+
+  elements.selectedObjectName.textContent = group.name;
+
+  if (groupObjects.length === 0) {
+    elements.propertyFields.innerHTML = '<div class="property-empty">Grupo vazio.</div>';
+    return;
+  }
+
+  const properties = [
+    createNumericProperty('Localização X', 'position-x', groupMetrics.originPixels[0], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
+    createNumericProperty('Localização Y', 'position-y', groupMetrics.originPixels[1], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
+    createNumericProperty('Localização Z', 'position-z', groupMetrics.originPixels[2], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
+    createToggleProperty('Movimento magnético', 'data-object-move-snap', group.moveSnap !== false, isLocked),
+    createPropertyDivider(),
+    createNumericProperty('Rotação X', 'rotation-x', Number(rotation[0] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
+    createNumericProperty('Rotação Y', 'rotation-y', Number(rotation[1] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
+    createNumericProperty('Rotação Z', 'rotation-z', Number(rotation[2] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
+    createToggleProperty('Rotação magnética', 'data-object-rotate-snap', group.rotateSnap !== false, isLocked),
+    createPropertyDivider(),
+    createNumericProperty('Largura', 'width', groupMetrics.widthPixels, { precision: 0, min: groupMetrics.tileSizePixels, step: 1, unit: 'px', disabled: isLocked }),
+    createNumericProperty('Profundidade', 'depth', groupMetrics.depthPixels, { precision: 0, min: groupMetrics.tileSizePixels, step: 1, unit: 'px', disabled: isLocked }),
+    createNumericProperty('Altura', 'height', groupMetrics.heightPixels, { precision: 0, min: 1, step: 1, unit: 'px', disabled: isLocked }),
+    createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01, disabled: isLocked }),
+    createToggleProperty('Transformação magnética', 'data-tile-resize-snap', group.resizeSnap !== false, isLocked),
+    createPropertyDivider(),
+    `<div class="property-note"><span>Itens</span><span>${groupObjects.length}</span></div>`,
+    `<div class="property-note"><span>Quadrado</span><span>${groupMetrics.tileSizePixels} x ${groupMetrics.tileSizePixels} px</span></div>`
+  ];
+
+  elements.propertyFields.innerHTML = properties.join('');
+
+  if (isLocked) {
+    setPropertiesDisabled('Grupo bloqueado. Desbloqueie o cadeado para editar o grupo.');
+  }
 }
 
 function updateSelectedNumericProperty(input, options = {}) {
+  if (state.selectedGroupId) {
+    updateSelectedGroupNumericProperty(input, options);
+    return;
+  }
+
   const selectedObject = getSelectedObject();
   const propertyKey = input.dataset.propertyKey;
   const numericValue = parsePropertyNumber(input.value);
@@ -997,6 +1366,13 @@ function updateSelectedNumericProperty(input, options = {}) {
   const shouldRecordHistory = options.recordHistory !== false;
 
   if (!selectedObject || !propertyKey || numericValue === null) {
+    if (shouldRender) {
+      renderPropertiesPanel();
+    }
+    return;
+  }
+
+  if (isObjectEffectivelyLocked(selectedObject)) {
     if (shouldRender) {
       renderPropertiesPanel();
     }
@@ -1028,6 +1404,11 @@ function updateSelectedNumericProperty(input, options = {}) {
       ...selectedObject.transform,
       rotation
     };
+  } else if (propertyKey === 'rounding-all' && selectedObject.type === 'tile') {
+    selectedObject.rounding = setAllRoundingEdges(numericValue);
+  } else if (propertyKey.startsWith('rounding-edge-') && selectedObject.type === 'tile') {
+    const edgeId = propertyKey.slice('rounding-edge-'.length);
+    selectedObject.rounding = setRoundingEdgeValue(selectedObject.rounding, edgeId, numericValue);
   } else if (propertyKey === 'scale') {
     const scaleValue = Math.max(0.01, numericValue);
     selectedObject.transform = {
@@ -1039,6 +1420,75 @@ function updateSelectedNumericProperty(input, options = {}) {
   }
 
   updateTileGridPositionFromTransform(selectedObject);
+  syncProjectSceneToViewport();
+
+  if (shouldRender) {
+    renderObjectTree();
+    renderPropertiesPanel();
+  }
+
+  if (shouldRecordHistory) {
+    markEditorDirty();
+  }
+}
+
+function updateSelectedGroupNumericProperty(input, options = {}) {
+  const group = getSelectedGroup();
+  const propertyKey = input.dataset.propertyKey;
+  const numericValue = parsePropertyNumber(input.value);
+  const shouldRender = options.render !== false;
+  const shouldRecordHistory = options.recordHistory !== false;
+
+  if (!group || !propertyKey || numericValue === null) {
+    if (shouldRender) {
+      renderPropertiesPanel();
+    }
+    return;
+  }
+
+  if (getGroupLocked(group)) {
+    if (shouldRender) {
+      renderPropertiesPanel();
+    }
+    return;
+  }
+
+  const bounds = getGroupTransformBounds(group);
+  const groupMetrics = getGroupDimensionPixels(group, bounds);
+
+  if (propertyKey.startsWith('position-')) {
+    const axisIndex = propertyKey.endsWith('x') ? 0 : propertyKey.endsWith('y') ? 1 : 2;
+    const currentPositionPixels = groupMetrics.originPixels;
+    const nextPositionPixels = [...currentPositionPixels];
+    nextPositionPixels[axisIndex] = numericValue;
+    moveGroupByDelta(group, [
+      (nextPositionPixels[0] - currentPositionPixels[0]) / groupMetrics.tileSizePixels,
+      (nextPositionPixels[1] - currentPositionPixels[1]) / groupMetrics.tileSizePixels,
+      (nextPositionPixels[2] - currentPositionPixels[2]) / groupMetrics.tileSizePixels
+    ]);
+  } else if (propertyKey.startsWith('rotation-')) {
+    const axisIndex = propertyKey.endsWith('x') ? 0 : propertyKey.endsWith('y') ? 1 : 2;
+    const rotation = [...(group.transform?.rotation || [0, 0, 0])];
+    const deltaDegrees = numericValue - rotationOrZero(rotation[axisIndex]);
+    rotation[axisIndex] = numericValue;
+    group.transform = {
+      ...group.transform,
+      rotation
+    };
+    rotateGroupByDelta(group, axisIndex, deltaDegrees, bounds.center);
+  } else if (propertyKey === 'scale') {
+    const nextScale = Math.max(0.01, numericValue);
+    scaleGroupTo(group, nextScale, bounds.center);
+  } else if (propertyKey === 'width' || propertyKey === 'depth' || propertyKey === 'height') {
+    const axis = propertyKey === 'width' ? 'x' : propertyKey === 'height' ? 'y' : 'z';
+    const minimumUnits = getGroupResizeMinimumUnits(axis);
+    const nextUnits = propertyKey === 'height'
+      ? getTileHeightUnits(groupMetrics.tileSizePixels, Math.max(1, Math.round(numericValue)))
+      : Math.max(minimumUnits, Math.round(numericValue) / groupMetrics.tileSizePixels);
+    const startUnits = Math.max(bounds.half[axis] * 2, minimumUnits);
+    applyGroupResizeFromStart(group, cloneGroupObjectTransforms(group), axis, 1, bounds.center, startUnits, nextUnits);
+  }
+
   syncProjectSceneToViewport();
 
   if (shouldRender) {
@@ -1202,7 +1652,7 @@ function setActiveTileset(tilesetId) {
   renderTileStylePanel();
 }
 
-function renderTilesetTab(label, tilesetId) {
+function renderTilesetTab(label, tilesetId, options = {}) {
   const button = document.createElement('button');
   const isActive = state.activeTilesetId === tilesetId;
 
@@ -1213,6 +1663,30 @@ function renderTilesetTab(label, tilesetId) {
   button.setAttribute('aria-selected', String(isActive));
   button.classList.toggle('active', isActive);
   button.addEventListener('click', () => setActiveTileset(tilesetId));
+
+  if (options.closable) {
+    const item = document.createElement('div');
+    const closeButton = document.createElement('button');
+
+    item.className = 'tileset-tab-item';
+    item.classList.toggle('active', isActive);
+    button.classList.add('tileset-tab-closable');
+    closeButton.type = 'button';
+    closeButton.className = 'tileset-tab-close';
+    closeButton.setAttribute('aria-label', `Remover ${label}`);
+    closeButton.title = 'Remover TileSet';
+    closeButton.append(createIconElement('#icon-close'));
+    closeButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const tileset = getTilesetById(tilesetId);
+
+      if (tileset) {
+        openDeleteTilesetModal(tileset);
+      }
+    });
+    item.append(button, closeButton);
+    return item;
+  }
 
   return button;
 }
@@ -1226,7 +1700,7 @@ function renderTileStylePanel() {
   elements.tileSetTabs.append(renderTilesetTab('Cores', defaultTilesetId));
 
   getTilesets().forEach((tileset) => {
-    elements.tileSetTabs.append(renderTilesetTab(tileset.name, tileset.id));
+    elements.tileSetTabs.append(renderTilesetTab(tileset.name, tileset.id, { closable: true }));
   });
 
   const addButton = document.createElement('button');
@@ -1357,6 +1831,48 @@ function addTilesetTab() {
   state.activeTilesetId = tileset.id;
   renderTileStylePanel();
   markEditorDirty();
+}
+
+function replaceRemovedTilesetMaterials(tilesetId) {
+  getSceneObjects().forEach((object) => {
+    const material = normalizeTileMaterial(object.material);
+
+    if (material.texture?.tilesetId === tilesetId) {
+      object.material = {
+        color: defaultTileColor
+      };
+    }
+  });
+}
+
+function removeTileset(tilesetId) {
+  if (!state.activeProject || tilesetId === defaultTilesetId) {
+    return null;
+  }
+
+  const tileset = getTilesetById(tilesetId);
+
+  if (!tileset) {
+    return null;
+  }
+
+  state.activeProject.tilesets = getTilesets().filter((item) => item.id !== tilesetId);
+  replaceRemovedTilesetMaterials(tilesetId);
+
+  if (state.activeTilesetId === tilesetId) {
+    state.activeTilesetId = defaultTilesetId;
+  }
+
+  if (state.pendingTilesetImportId === tilesetId) {
+    state.pendingTilesetImportId = null;
+  }
+
+  disposeTextureCache();
+  syncProjectSceneToViewport();
+  renderTileStylePanel();
+  markEditorDirty();
+
+  return tileset;
 }
 
 function triggerTilesetImport(tilesetId) {
@@ -1731,7 +2247,9 @@ function toggleObjectLock(objectId) {
   }
 
   object.locked = !getObjectLocked(object);
+  renderTransformHandles();
   renderObjectTree();
+  renderPropertiesPanel();
   markEditorDirty();
 }
 
@@ -1744,6 +2262,7 @@ function toggleGroupVisibility(groupId) {
 
   group.visible = !getGroupVisibility(group);
   syncProjectSceneToViewport();
+  renderTransformHandles();
   renderObjectTree();
   markEditorDirty();
 }
@@ -1756,7 +2275,9 @@ function toggleGroupLock(groupId) {
   }
 
   group.locked = !getGroupLocked(group);
+  renderTransformHandles();
   renderObjectTree();
+  renderPropertiesPanel();
   markEditorDirty();
 }
 
@@ -1900,12 +2421,21 @@ function groupSelectedObjects() {
     name: nextGroupName(),
     visible: true,
     locked: false,
+    transform: {
+      position: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1]
+    },
+    moveSnap: true,
+    rotateSnap: true,
+    resizeSnap: true,
     objectIds
   });
   state.expandedGroupIds.add(groupId);
 
-  setSelectedObjects(objectIds, objectIds.at(-1));
+  selectGroup(groupId);
   renderObjectTree();
+  renderPropertiesPanel();
   markEditorDirty();
 }
 
@@ -2115,6 +2645,19 @@ function createThumbnail(project, index) {
   thumbnail.className = `project-thumbnail project-thumbnail-${(index % 4) + 1}`;
   thumbnail.setAttribute('aria-hidden', 'true');
 
+  if (project.thumbnail) {
+    thumbnail.classList.add('project-thumbnail-captured');
+
+    const image = document.createElement('img');
+    image.src = project.thumbnail;
+    image.alt = '';
+    image.loading = 'lazy';
+    image.decoding = 'async';
+
+    thumbnail.append(image);
+    return thumbnail;
+  }
+
   const grid = document.createElement('div');
   grid.className = 'thumbnail-grid';
 
@@ -2125,10 +2668,6 @@ function createThumbnail(project, index) {
   plane.className = 'thumbnail-plane';
 
   thumbnail.append(grid, object, plane);
-
-  if (project.thumbnail) {
-    thumbnail.style.backgroundImage = `url("${project.thumbnail}")`;
-  }
 
   return thumbnail;
 }
@@ -2305,6 +2844,24 @@ async function deleteProjectFromModal(event) {
   }
 }
 
+function deleteTilesetFromModal(event) {
+  event.preventDefault();
+
+  if (!state.deleteTileset) {
+    closeDeleteTilesetModal();
+    return;
+  }
+
+  const tilesetName = state.deleteTileset.name;
+  const removedTileset = removeTileset(state.deleteTileset.id);
+
+  closeDeleteTilesetModal();
+
+  if (removedTileset) {
+    showMessage(`TileSet removido: ${tilesetName}`);
+  }
+}
+
 async function openProjectDialog() {
   try {
     const project = await window.engineFlat.projects.openDialog();
@@ -2334,6 +2891,90 @@ async function openRecentProject(projectId) {
   }
 }
 
+function getCenteredCrop(sourceWidth, sourceHeight, targetAspectRatio) {
+  let width = sourceWidth;
+  let height = width / targetAspectRatio;
+
+  if (height > sourceHeight) {
+    height = sourceHeight;
+    width = height * targetAspectRatio;
+  }
+
+  return {
+    x: Math.max(0, (sourceWidth - width) / 2),
+    y: Math.max(0, (sourceHeight - height) / 2),
+    width,
+    height
+  };
+}
+
+function captureViewportThumbnail() {
+  if (!viewport.initialized || !viewport.renderer || !viewport.scene || !viewport.camera) {
+    return null;
+  }
+
+  const sourceCanvas = viewport.renderer.domElement;
+
+  if (!sourceCanvas.width || !sourceCanvas.height) {
+    return null;
+  }
+
+  const hiddenObjects = [
+    viewport.transformHandleGroup,
+    viewport.lightMarker,
+    viewport.bucketPreviewGroup
+  ].filter(Boolean);
+  const previousVisibility = hiddenObjects.map((object) => object.visible);
+
+  try {
+    hiddenObjects.forEach((object) => {
+      object.visible = false;
+    });
+    viewport.sceneObjectMeshes.forEach((mesh) => setTileMeshSelected(mesh, false));
+
+    viewport.controls?.update();
+    viewport.renderer.render(viewport.scene, viewport.camera);
+
+    const thumbnailCanvas = document.createElement('canvas');
+    thumbnailCanvas.width = projectThumbnailWidthPixels;
+    thumbnailCanvas.height = projectThumbnailHeightPixels;
+
+    const context = thumbnailCanvas.getContext('2d');
+
+    if (!context) {
+      return null;
+    }
+
+    const crop = getCenteredCrop(
+      sourceCanvas.width,
+      sourceCanvas.height,
+      projectThumbnailWidthPixels / projectThumbnailHeightPixels
+    );
+
+    context.drawImage(
+      sourceCanvas,
+      crop.x,
+      crop.y,
+      crop.width,
+      crop.height,
+      0,
+      0,
+      projectThumbnailWidthPixels,
+      projectThumbnailHeightPixels
+    );
+
+    return thumbnailCanvas.toDataURL('image/webp', projectThumbnailQuality);
+  } catch {
+    return null;
+  } finally {
+    hiddenObjects.forEach((object, index) => {
+      object.visible = previousVisibility[index];
+    });
+    applyViewportSelectionState();
+    viewport.renderer.render(viewport.scene, viewport.camera);
+  }
+}
+
 async function saveActiveProject() {
   if (!state.activeProject) {
     showMessage('Abra ou crie um projeto antes de salvar.');
@@ -2341,11 +2982,13 @@ async function saveActiveProject() {
   }
 
   try {
+    const thumbnail = captureViewportThumbnail() || state.activeProject.thumbnail || null;
     const project = await window.engineFlat.projects.save(state.activeProject.id, {
       description: state.activeProject.description,
       grid: state.activeProject.grid,
       tilesets: state.activeProject.tilesets,
-      scene: state.activeProject.scene
+      scene: state.activeProject.scene,
+      thumbnail
     });
 
     setActiveProject(project, { resetHistory: false });
@@ -2507,13 +3150,138 @@ function createTileRenderMaterial(tileMaterial) {
   });
 }
 
+function getAxisDimension(axis, width, height, depth) {
+  if (axis === 'x') {
+    return width;
+  }
+
+  if (axis === 'y') {
+    return height;
+  }
+
+  return depth;
+}
+
+function getRoundingEdgeRadius(edge, percent, width, height, depth) {
+  const firstDimension = getAxisDimension(edge.fixedAxes[0].axis, width, height, depth);
+  const secondDimension = getAxisDimension(edge.fixedAxes[1].axis, width, height, depth);
+  const maxRadius = Math.max(0, Math.min(firstDimension, secondDimension) * 0.48);
+
+  return maxRadius * (clampRoundingPercent(percent) / 100);
+}
+
+function getRoundingHalfExtents(width, height, depth) {
+  return {
+    x: width / 2,
+    y: height / 2,
+    z: depth / 2
+  };
+}
+
+function deformRoundedTilePosition(position, width, height, depth, rounding) {
+  const normalizedRounding = normalizeTileRounding(rounding);
+  const half = getRoundingHalfExtents(width, height, depth);
+  const axisInsets = { x: 0, y: 0, z: 0 };
+
+  roundingEdgeDefinitions.forEach((edge) => {
+    const percent = normalizedRounding.edges[edge.id];
+    const radius = getRoundingEdgeRadius(edge, percent, width, height, depth);
+
+    if (radius <= 0.0001) {
+      return;
+    }
+
+    const distances = edge.fixedAxes.map((fixed) => half[fixed.axis] - (fixed.sign * position[fixed.axis]));
+
+    if (distances.some((distance) => distance < -0.0001 || distance > radius)) {
+      return;
+    }
+
+    edge.fixedAxes.forEach((fixed) => {
+      axisInsets[fixed.axis] = Math.max(axisInsets[fixed.axis], radius);
+    });
+  });
+
+  const activeAxes = ['x', 'y', 'z'].filter((axis) => axisInsets[axis] > 0.0001);
+
+  if (activeAxes.length < 2) {
+    return;
+  }
+
+  let normalizedLengthSq = 0;
+  const centers = {};
+  const offsets = {};
+
+  activeAxes.forEach((axis) => {
+    const sign = position[axis] < 0 ? -1 : 1;
+    const radius = axisInsets[axis];
+    const center = sign * (half[axis] - radius);
+    const offset = position[axis] - center;
+
+    centers[axis] = center;
+    offsets[axis] = offset;
+    normalizedLengthSq += (offset / radius) ** 2;
+  });
+
+  if (normalizedLengthSq <= 0.0001) {
+    return;
+  }
+
+  const normalizedLength = Math.sqrt(normalizedLengthSq);
+
+  if (normalizedLength <= 1.0001) {
+    return;
+  }
+
+  activeAxes.forEach((axis) => {
+    position[axis] = centers[axis] + (offsets[axis] / normalizedLength);
+  });
+}
+
+function createRoundedTileGeometry(width, height, depth, rounding) {
+  const baseGeometry = new THREE.BoxGeometry(
+    width,
+    height,
+    depth,
+    roundingGeometrySegments,
+    roundingGeometrySegments,
+    roundingGeometrySegments
+  );
+  const geometry = baseGeometry.toNonIndexed();
+  const positions = geometry.attributes.position;
+  const position = new THREE.Vector3();
+
+  baseGeometry.dispose();
+
+  for (let index = 0; index < positions.count; index += 1) {
+    position.fromBufferAttribute(positions, index);
+    deformRoundedTilePosition(position, width, height, depth, rounding);
+    positions.setXYZ(index, position.x, position.y, position.z);
+  }
+
+  positions.needsUpdate = true;
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  return geometry;
+}
+
+function createTileGeometry(width, height, depth, rounding) {
+  if (!hasTileRounding(rounding)) {
+    return new THREE.BoxGeometry(width, height, depth);
+  }
+
+  return createRoundedTileGeometry(width, height, depth, rounding);
+}
+
 function createExportTileMesh(sceneObject) {
   const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
   const widthUnits = (sceneObject.size?.widthPixels || tileSizePixels) / tileSizePixels;
   const depthUnits = (sceneObject.size?.depthPixels || tileSizePixels) / tileSizePixels;
   const heightPixels = sceneObject.size?.heightPixels || 1;
   const heightUnits = getTileHeightUnits(tileSizePixels, heightPixels);
-  const geometry = new THREE.BoxGeometry(widthUnits, heightUnits, depthUnits);
+  const geometry = createTileGeometry(widthUnits, heightUnits, depthUnits, sceneObject.rounding);
   const material = createTileRenderMaterial(sceneObject.material);
   const mesh = new THREE.Mesh(geometry, material);
   const position = sceneObject.transform?.position || [0, heightUnits / 2, 0];
@@ -2663,57 +3431,250 @@ const axisGizmoVectors = {
   z: new THREE.Vector3(0, 1, 0)
 };
 
-function setAxisPointStyle(point, screenX, screenY, depth) {
-  const scale = 0.86 + ((depth + 1) * 0.1);
-  point.style.setProperty('--axis-x', `${screenX}px`);
-  point.style.setProperty('--axis-y', `${screenY}px`);
-  point.style.setProperty('--axis-scale', scale.toFixed(3));
-  point.style.setProperty('--axis-opacity', String(0.62 + ((depth + 1) * 0.18)));
-  point.style.zIndex = String(Math.round((depth + 1.2) * 20));
-  point.classList.toggle('axis-front', depth > 0.18);
+function createAxisSpriteTexture(label, color, options = {}) {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+  const size = 128;
+  const drawCircle = options.circle !== false;
+  const drawLabel = options.label !== false && Boolean(label);
+
+  canvas.width = size;
+  canvas.height = size;
+  context.clearRect(0, 0, size, size);
+
+  if (drawCircle) {
+    context.fillStyle = color;
+    context.beginPath();
+    context.arc(size / 2, size / 2, 43, 0, Math.PI * 2);
+    context.fill();
+  }
+
+  if (drawLabel) {
+    context.fillStyle = options.textColor || '#0b0d10';
+    context.font = `${options.fontWeight || 800} ${options.fontSize || 48}px system-ui, sans-serif`;
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(label, size / 2, (size / 2) + 1);
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+
+  return texture;
 }
 
-function updateAxisGizmo() {
-  if (!elements.axisGizmo || !viewport.camera) {
+function createAxisSprite(label, color, options = {}) {
+  const material = new THREE.SpriteMaterial({
+    map: createAxisSpriteTexture(label, color, options),
+    transparent: true,
+    opacity: options.opacity ?? 1,
+    depthTest: false,
+    depthWrite: false
+  });
+  const sprite = new THREE.Sprite(material);
+  const size = options.size || 0.46;
+
+  sprite.scale.set(size, size, size);
+  sprite.renderOrder = options.renderOrder || 4;
+  sprite.userData.axisGizmoBaseSize = size;
+
+  return sprite;
+}
+
+function createAxisGizmoAxis(axis, color, label) {
+  const vector = axisGizmoVectors[axis].clone();
+  const group = new THREE.Group();
+  const positive = vector.clone().multiplyScalar(0.76);
+  const negative = vector.clone().multiplyScalar(-0.76);
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([negative, positive]),
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.72,
+      depthTest: false
+    })
+  );
+  const positiveEndpoint = createAxisSprite(label, color, { size: 0.58, renderOrder: 5 });
+  const negativeEndpoint = createAxisSprite('', color, { size: 0.58, opacity: 0.48, renderOrder: 2 });
+  const negativeLabel = createAxisSprite(`-${label}`, color, {
+    circle: false,
+    textColor: '#ffffff',
+    fontSize: 48,
+    size: 0.58,
+    opacity: 0,
+    renderOrder: 6
+  });
+
+  line.renderOrder = 1;
+  positiveEndpoint.position.copy(positive);
+  negativeEndpoint.position.copy(negative);
+  negativeLabel.position.copy(negative);
+  positiveEndpoint.userData.axisGizmoTarget = { axis, sign: 1 };
+  negativeEndpoint.userData.axisGizmoTarget = { axis, sign: -1 };
+  negativeLabel.userData.axisGizmoTarget = { axis, sign: -1 };
+  positiveEndpoint.userData.axisGizmoKind = 'positive';
+  negativeEndpoint.userData.axisGizmoKind = 'negativeCircle';
+  negativeLabel.userData.axisGizmoKind = 'negativeLabel';
+  negativeEndpoint.userData.negativeAxisLabel = negativeLabel;
+  viewport.axisGizmoTargets.push(positiveEndpoint, negativeEndpoint, negativeLabel);
+  group.add(line, positiveEndpoint, negativeEndpoint, negativeLabel);
+
+  return group;
+}
+
+function initAxisGizmo() {
+  if (!elements.axisGizmoCanvas || viewport.axisGizmoRenderer) {
     return;
   }
 
-  const center = 48;
-  const radius = 32;
-  const inverseCameraRotation = viewport.camera.quaternion.clone().invert();
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-1.15, 1.15, 1.15, -1.15, 0.1, 10);
+  const root = new THREE.Group();
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: true,
+    canvas: elements.axisGizmoCanvas
+  });
+  const disc = new THREE.Mesh(
+    new THREE.CircleGeometry(0.68, 48),
+    new THREE.MeshBasicMaterial({
+      color: getCssColor('--md-sys-color-surface-container-highest'),
+      transparent: true,
+      opacity: 0.34,
+      depthTest: false
+    })
+  );
+
+  camera.position.set(0, 0, 4);
+  camera.lookAt(0, 0, 0);
+  renderer.setClearColor(0x000000, 0);
+  disc.renderOrder = 0;
+  root.add(disc);
+  root.add(createAxisGizmoAxis('x', getCssColor('--viewport-axis-x'), 'X'));
+  root.add(createAxisGizmoAxis('y', getCssColor('--viewport-axis-y'), 'Y'));
+  root.add(createAxisGizmoAxis('z', getCssColor('--viewport-axis-z'), 'Z'));
+  scene.add(root);
+
+  viewport.axisGizmoRenderer = renderer;
+  viewport.axisGizmoScene = scene;
+  viewport.axisGizmoCamera = camera;
+  viewport.axisGizmoRoot = root;
+  resizeAxisGizmo();
+}
+
+function resizeAxisGizmo() {
+  if (!viewport.axisGizmoRenderer || !elements.axisGizmo) {
+    return;
+  }
+
+  const { clientWidth, clientHeight } = elements.axisGizmo;
+
+  if (clientWidth === 0 || clientHeight === 0) {
+    return;
+  }
+
+  viewport.axisGizmoRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  viewport.axisGizmoRenderer.setSize(clientWidth, clientHeight, false);
+}
+
+function updateAxisGizmo() {
+  if (!viewport.camera) {
+    return;
+  }
+
+  initAxisGizmo();
+
+  if (!viewport.axisGizmoRoot || !viewport.axisGizmoRenderer || !viewport.axisGizmoScene || !viewport.axisGizmoCamera) {
+    return;
+  }
+
+  viewport.axisGizmoRoot.quaternion.copy(viewport.camera.quaternion).invert();
+  updateAxisGizmoDepth();
+  viewport.axisGizmoRenderer.render(viewport.axisGizmoScene, viewport.axisGizmoCamera);
+}
+
+function updateAxisGizmoDepth() {
+  if (!viewport.axisGizmoRoot) {
+    return;
+  }
 
   Object.entries(axisGizmoVectors).forEach(([axis, vector]) => {
-    const localVector = vector.clone().applyQuaternion(inverseCameraRotation);
-    const screenVector = new THREE.Vector2(localVector.x, -localVector.y);
-    const screenLength = screenVector.length();
-    const direction = screenLength > 0.001
-      ? screenVector.multiplyScalar(1 / screenLength)
-      : new THREE.Vector2(0, 0);
-    const projectedLength = Math.max(10, radius * Math.min(1, screenLength));
-    const positiveX = center + (direction.x * radius);
-    const positiveY = center + (direction.y * radius);
-    const negativeX = center - (direction.x * radius);
-    const negativeY = center - (direction.y * radius);
-    const positivePoint = elements.axisGizmo.querySelector(`[data-axis="${axis}"][data-sign="1"]`);
-    const negativePoint = elements.axisGizmo.querySelector(`[data-axis="${axis}"][data-sign="-1"]`);
-    const line = elements.axisGizmo.querySelector(`[data-axis-line="${axis}"]`);
+    const localVector = vector.clone().applyQuaternion(viewport.axisGizmoRoot.quaternion);
+    const positiveDepth = localVector.z;
+    const negativeDepth = -localVector.z;
 
-    if (positivePoint) {
-      setAxisPointStyle(positivePoint, positiveX, positiveY, localVector.z);
-    }
+    viewport.axisGizmoTargets.forEach((target) => {
+      const targetData = target.userData.axisGizmoTarget;
 
-    if (negativePoint) {
-      setAxisPointStyle(negativePoint, negativeX, negativeY, -localVector.z);
-    }
+      if (!targetData || targetData.axis !== axis) {
+        return;
+      }
 
-    if (line) {
-      line.style.setProperty('--axis-left', `${center}px`);
-      line.style.setProperty('--axis-top', `${center}px`);
-      line.style.setProperty('--axis-length', `${screenLength < 0.05 ? 0 : projectedLength}px`);
-      line.style.setProperty('--axis-angle', `${Math.atan2(direction.y, direction.x)}rad`);
-      line.style.setProperty('--axis-opacity', String(0.26 + (screenLength * 0.42)));
-    }
+      const depth = targetData.sign > 0 ? positiveDepth : negativeDepth;
+      const baseSize = target.userData.axisGizmoBaseSize || 0.58;
+      const depthScale = 0.86 + (((depth + 1) / 2) * 0.3);
+      const nextSize = baseSize * depthScale;
+      target.scale.set(nextSize, nextSize, nextSize);
+
+      if (targetData.sign < 0) {
+        if (target.userData.axisGizmoKind === 'negativeCircle') {
+          target.material.opacity = 0.34 + Math.max(0, negativeDepth) * 0.34;
+          target.userData.negativeAxisLabel.material.opacity = negativeDepth > 0.18 ? 0.94 : 0;
+          target.userData.negativeAxisLabel.scale.set(nextSize, nextSize, nextSize);
+        } else if (target.userData.axisGizmoKind === 'negativeLabel') {
+          target.material.opacity = negativeDepth > 0.18 ? 0.94 : 0;
+        }
+      }
+    });
   });
+}
+
+function getAxisGizmoTargetFromEvent(event) {
+  if (!viewport.axisGizmoRenderer || !viewport.axisGizmoCamera || viewport.axisGizmoTargets.length === 0) {
+    return null;
+  }
+
+  const rect = elements.axisGizmo.getBoundingClientRect();
+  viewport.axisGizmoPointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  viewport.axisGizmoPointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+  viewport.axisGizmoRaycaster.setFromCamera(viewport.axisGizmoPointer, viewport.axisGizmoCamera);
+
+  const intersections = viewport.axisGizmoRaycaster
+    .intersectObjects(viewport.axisGizmoTargets, false)
+    .filter((intersection) => intersection.object.material?.opacity !== 0);
+
+  return intersections[0]?.object?.userData.axisGizmoTarget || null;
+}
+
+function handleAxisGizmoClick(event) {
+  const target = getAxisGizmoTargetFromEvent(event);
+
+  if (!target) {
+    return;
+  }
+
+  event.preventDefault();
+  focusCameraOnAxis(target.axis, target.sign);
+}
+
+function handleAxisGizmoKeydown(event) {
+  const keyMap = {
+    x: ['x', 1],
+    y: ['y', 1],
+    z: ['z', 1],
+    X: ['x', -1],
+    Y: ['y', -1],
+    Z: ['z', -1]
+  };
+  const target = keyMap[event.key];
+
+  if (!target) {
+    return;
+  }
+
+  event.preventDefault();
+  focusCameraOnAxis(target[0], target[1]);
 }
 
 function getCameraUpForAxis(axis, sign) {
@@ -2785,7 +3746,7 @@ function createTileMesh(sceneObject) {
   const depthUnits = (sceneObject.size?.depthPixels || tileSizePixels) / tileSizePixels;
   const heightPixels = sceneObject.size?.heightPixels || 1;
   const heightUnits = getTileHeightUnits(tileSizePixels, heightPixels);
-  const geometry = new THREE.BoxGeometry(widthUnits, heightUnits, depthUnits);
+  const geometry = createTileGeometry(widthUnits, heightUnits, depthUnits, sceneObject.rounding);
   const material = createTileRenderMaterial(sceneObject.material);
   const mesh = new THREE.Mesh(geometry, material);
   const position = sceneObject.transform?.position || [0, heightUnits / 2, 0];
@@ -2800,14 +3761,14 @@ function createTileMesh(sceneObject) {
     THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[2]))
   );
   mesh.scale.setScalar(getObjectUniformScale(sceneObject));
-  setTileMeshSelected(mesh, state.selectedObjectIds.has(sceneObject.id));
+  setTileMeshSelected(mesh, state.selectedObjectIds.has(sceneObject.id) || getSelectedGroup()?.objectIds.includes(sceneObject.id));
 
   return mesh;
 }
 
 function createTileSelectionOutline(tileGeometry) {
   const outline = new THREE.LineSegments(
-    new THREE.EdgesGeometry(tileGeometry),
+    new THREE.EdgesGeometry(tileGeometry, 28),
     new THREE.LineBasicMaterial({
       color: getCssColor('--md-sys-color-primary'),
       transparent: true,
@@ -2849,8 +3810,11 @@ function applyViewportSelectionState() {
     return;
   }
 
+  const selectedGroup = getSelectedGroup();
+  const selectedGroupObjectIds = new Set(selectedGroup?.objectIds || []);
+
   viewport.sceneObjectMeshes.forEach((mesh, objectId) => {
-    setTileMeshSelected(mesh, state.selectedObjectIds.has(objectId));
+    setTileMeshSelected(mesh, state.selectedObjectIds.has(objectId) || selectedGroupObjectIds.has(objectId));
   });
 }
 
@@ -2924,6 +3888,102 @@ function getTransformAxisDirection(axis, side = 1) {
   }
 
   return new THREE.Vector3(0, 0, side);
+}
+
+function getRoundingEdgeBasis(edge, bounds) {
+  const origin = bounds.center.clone();
+  const direction = new THREE.Vector3();
+
+  edge.fixedAxes.forEach((fixed) => {
+    origin[fixed.axis] += fixed.sign * bounds.half[fixed.axis];
+    direction[fixed.axis] = fixed.sign;
+  });
+
+  return {
+    origin,
+    direction: direction.normalize()
+  };
+}
+
+function getRoundingAxisColor(axis) {
+  if (axis === 'x') {
+    return getCssColor('--viewport-axis-x');
+  }
+
+  if (axis === 'y') {
+    return getCssColor('--viewport-axis-y');
+  }
+
+  return getCssColor('--viewport-axis-z');
+}
+
+function getRoundingAxisEdgeIds(axis) {
+  return roundingEdgeDefinitions
+    .filter((edge) => edge.axis === axis)
+    .map((edge) => edge.id);
+}
+
+function getRoundingAxisBasis(axis, bounds) {
+  const direction = getTransformAxisDirection(axis, 1);
+  const origin = bounds.center.clone().add(direction.clone().multiplyScalar(bounds.half[axis]));
+
+  return { origin, direction };
+}
+
+function getRoundingAllBasis(bounds) {
+  const direction = new THREE.Vector3(1, 1, 1).normalize();
+  const origin = bounds.center.clone().add(new THREE.Vector3(bounds.half.x, bounds.half.y, bounds.half.z));
+
+  return { origin, direction };
+}
+
+function getRoundingHandleBasis(handle, bounds) {
+  if (handle.roundingMode === 'axis') {
+    return getRoundingAxisBasis(handle.axis, bounds);
+  }
+
+  if (handle.roundingMode === 'all') {
+    return getRoundingAllBasis(bounds);
+  }
+
+  const edge = handle.edge || roundingEdgeDefinitions.find((item) => item.id === handle.edgeId);
+  return edge ? getRoundingEdgeBasis(edge, bounds) : null;
+}
+
+function getRoundingHandleColor(handle) {
+  if (handle.roundingMode === 'all') {
+    return getCssColor('--md-sys-color-on-surface');
+  }
+
+  return getRoundingAxisColor(handle.axis);
+}
+
+function getRoundingHandleDefinitions() {
+  if (state.roundingControlMode === 'axis') {
+    return ['x', 'y', 'z'].map((axis) => ({
+      roundingHandleId: `axis:${axis}`,
+      roundingMode: 'axis',
+      axis,
+      edgeIds: getRoundingAxisEdgeIds(axis)
+    }));
+  }
+
+  if (state.roundingControlMode === 'all') {
+    return [{
+      roundingHandleId: 'all',
+      roundingMode: 'all',
+      edgeIds: [...roundingEdgeIds]
+    }];
+  }
+
+  return roundingEdgeDefinitions.map((edge) => ({
+    roundingHandleId: `edge:${edge.id}`,
+    roundingMode: 'edge',
+    axis: edge.axis,
+    edge,
+    edgeId: edge.id,
+    edgeIds: [edge.id]
+  }));
 }
 
 function setTransformHandleMaterialOpacity(object, opacity) {
@@ -3035,6 +4095,7 @@ function createResizeHandle(tile, axis, side, origin, direction) {
   const color = getTransformAxisColor(axis);
   const handleData = {
     resizeHandle: {
+      targetType: 'object',
       objectId: tile.id,
       axis,
       side
@@ -3098,7 +4159,9 @@ function createMoveHandle(object, axis, side, origin) {
   const direction = getTransformAxisDirection(axis, side);
   const handleData = {
     moveHandle: {
-      objectId: object.id,
+      targetType: Array.isArray(object.objectIds) ? 'group' : 'object',
+      objectId: Array.isArray(object.objectIds) ? undefined : object.id,
+      groupId: Array.isArray(object.objectIds) ? object.id : undefined,
       axis,
       side
     }
@@ -3139,7 +4202,9 @@ function createRotateHandle(object, axis, center, radius) {
   const color = getTransformAxisColor(axis);
   const handleData = {
     rotateHandle: {
-      objectId: object.id,
+      targetType: Array.isArray(object.objectIds) ? 'group' : 'object',
+      objectId: Array.isArray(object.objectIds) ? undefined : object.id,
+      groupId: Array.isArray(object.objectIds) ? object.id : undefined,
       axis
     }
   };
@@ -3187,20 +4252,158 @@ function createRotateHandle(object, axis, center, radius) {
   return group;
 }
 
+function createGroupResizeHandle(groupObject, axis, side, origin) {
+  const group = new THREE.Group();
+  const color = getTransformAxisColor(axis);
+  const direction = getTransformAxisDirection(axis, side);
+  const handleData = {
+    groupResizeHandle: {
+      targetType: 'group',
+      groupId: groupObject.id,
+      axis,
+      side
+    }
+  };
+  const lineEnd = origin.clone().add(direction.clone().multiplyScalar(0.48));
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([origin, lineEnd]),
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.52,
+      depthTest: false
+    })
+  );
+  const grip = new THREE.Mesh(
+    new THREE.BoxGeometry(0.18, 0.18, 0.18),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.86,
+      depthTest: false
+    })
+  );
+  const hitTarget = new THREE.Mesh(
+    new THREE.SphereGeometry(0.24, 16, 12),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.04,
+      depthTest: false
+    })
+  );
+
+  line.renderOrder = 20;
+  grip.position.copy(lineEnd);
+  grip.renderOrder = 21;
+  hitTarget.position.copy(lineEnd);
+  hitTarget.renderOrder = 20;
+
+  const visualParts = [line, grip, hitTarget];
+  prepareTransformHandlePart(line, 0.52, 1);
+  prepareTransformHandlePart(grip, 0.86, 1, 1.16);
+  prepareTransformHandlePart(hitTarget, 0.04, 0.22, 1.08);
+  attachTransformHandleTarget(line, handleData, visualParts);
+  attachTransformHandleTarget(grip, handleData, visualParts);
+  attachTransformHandleTarget(hitTarget, handleData, visualParts);
+  group.add(line, grip, hitTarget);
+
+  return group;
+}
+
+function createRoundingHandle(tile, handleDefinition, bounds) {
+  const group = new THREE.Group();
+  const basis = getRoundingHandleBasis(handleDefinition, bounds);
+
+  if (!basis) {
+    return group;
+  }
+
+  const { origin, direction } = basis;
+  const color = getRoundingHandleColor(handleDefinition);
+  const handleData = {
+    roundingHandle: {
+      targetType: 'object',
+      objectId: tile.id,
+      roundingHandleId: handleDefinition.roundingHandleId,
+      roundingMode: handleDefinition.roundingMode,
+      axis: handleDefinition.axis,
+      edgeId: handleDefinition.edgeId,
+      edgeIds: handleDefinition.edgeIds
+    }
+  };
+  const tipPosition = origin.clone().add(direction.clone().multiplyScalar(0.48));
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([origin, tipPosition]),
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.58,
+      depthTest: false
+    })
+  );
+  const grip = new THREE.Mesh(
+    new THREE.SphereGeometry(0.13, 18, 14),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false
+    })
+  );
+  const hitTarget = new THREE.Mesh(
+    new THREE.SphereGeometry(0.24, 18, 14),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.04,
+      depthTest: false
+    })
+  );
+
+  line.renderOrder = 20;
+  grip.position.copy(tipPosition);
+  grip.renderOrder = 21;
+  hitTarget.position.copy(tipPosition);
+  hitTarget.renderOrder = 20;
+
+  const visualParts = [line, grip, hitTarget];
+  prepareTransformHandlePart(line, 0.58, 1);
+  prepareTransformHandlePart(grip, 0.9, 1, 1.18);
+  prepareTransformHandlePart(hitTarget, 0.04, 0.22, 1.1);
+  attachTransformHandleTarget(line, handleData, visualParts);
+  attachTransformHandleTarget(grip, handleData, visualParts);
+  attachTransformHandleTarget(hitTarget, handleData, visualParts);
+  group.add(line, grip, hitTarget);
+
+  return group;
+}
+
 function renderTransformHandles() {
   clearTransformHandles();
 
-  if (!viewport.scene || state.selectedObjectIds.size !== 1) {
+  if (!viewport.scene) {
     return;
   }
 
-  const tile = getSelectedObject();
+  const selectedGroup = getSelectedGroup();
+  const selectedObject = state.selectedObjectIds.size === 1 ? getSelectedObject() : null;
+  const target = selectedGroup || selectedObject;
+  const isGroupTarget = Boolean(selectedGroup);
 
-  if (!tile || !isObjectEffectivelyVisible(tile) || isObjectEffectivelyLocked(tile) || state.viewportTool === 'select' || isTileEditingToolActive()) {
+  if (!target || state.viewportTool === 'select' || isTileEditingToolActive()) {
     return;
   }
 
-  const bounds = getSelectedTransformBounds(tile);
+  if (isGroupTarget) {
+    if (!getGroupVisibility(selectedGroup) || getGroupLocked(selectedGroup) || getGroupObjects(selectedGroup).length === 0) {
+      return;
+    }
+  } else if (!isObjectEffectivelyVisible(selectedObject) || isObjectEffectivelyLocked(selectedObject)) {
+    return;
+  }
+
+  const bounds = isGroupTarget ? getGroupTransformBounds(selectedGroup) : getSelectedTransformBounds(selectedObject);
   const { center, half, radius } = bounds;
   const handleGroup = new THREE.Group();
 
@@ -3208,32 +4411,49 @@ function renderTransformHandles() {
 
   if (state.viewportTool === 'move') {
     handleGroup.add(
-      createMoveHandle(tile, 'x', 1, new THREE.Vector3(center.x + half.x, center.y, center.z)),
-      createMoveHandle(tile, 'x', -1, new THREE.Vector3(center.x - half.x, center.y, center.z)),
-      createMoveHandle(tile, 'z', 1, new THREE.Vector3(center.x, center.y, center.z + half.z)),
-      createMoveHandle(tile, 'z', -1, new THREE.Vector3(center.x, center.y, center.z - half.z)),
-      createMoveHandle(tile, 'y', 1, new THREE.Vector3(center.x, center.y + half.y, center.z)),
-      createMoveHandle(tile, 'y', -1, new THREE.Vector3(center.x, center.y - half.y, center.z))
+      createMoveHandle(target, 'x', 1, new THREE.Vector3(center.x + half.x, center.y, center.z)),
+      createMoveHandle(target, 'x', -1, new THREE.Vector3(center.x - half.x, center.y, center.z)),
+      createMoveHandle(target, 'z', 1, new THREE.Vector3(center.x, center.y, center.z + half.z)),
+      createMoveHandle(target, 'z', -1, new THREE.Vector3(center.x, center.y, center.z - half.z)),
+      createMoveHandle(target, 'y', 1, new THREE.Vector3(center.x, center.y + half.y, center.z)),
+      createMoveHandle(target, 'y', -1, new THREE.Vector3(center.x, center.y - half.y, center.z))
     );
   }
 
   if (state.viewportTool === 'rotate') {
     handleGroup.add(
-      createRotateHandle(tile, 'x', center, radius),
-      createRotateHandle(tile, 'y', center, radius * 1.08),
-      createRotateHandle(tile, 'z', center, radius * 1.16)
+      createRotateHandle(target, 'x', center, radius),
+      createRotateHandle(target, 'y', center, radius * 1.08),
+      createRotateHandle(target, 'z', center, radius * 1.16)
     );
   }
 
-  if (state.viewportTool === 'scale' && tile.type === 'tile') {
+  if (state.viewportTool === 'scale' && selectedObject?.type === 'tile') {
     handleGroup.add(
-      createResizeHandle(tile, 'x', 1, new THREE.Vector3(center.x + half.x, center.y, center.z), new THREE.Vector3(1, 0, 0)),
-      createResizeHandle(tile, 'x', -1, new THREE.Vector3(center.x - half.x, center.y, center.z), new THREE.Vector3(-1, 0, 0)),
-      createResizeHandle(tile, 'z', 1, new THREE.Vector3(center.x, center.y, center.z + half.z), new THREE.Vector3(0, 0, 1)),
-      createResizeHandle(tile, 'z', -1, new THREE.Vector3(center.x, center.y, center.z - half.z), new THREE.Vector3(0, 0, -1)),
-      createResizeHandle(tile, 'y', 1, new THREE.Vector3(center.x, center.y + half.y, center.z), new THREE.Vector3(0, 1, 0)),
-      createResizeHandle(tile, 'y', -1, new THREE.Vector3(center.x, center.y - half.y, center.z), new THREE.Vector3(0, -1, 0))
+      createResizeHandle(selectedObject, 'x', 1, new THREE.Vector3(center.x + half.x, center.y, center.z), new THREE.Vector3(1, 0, 0)),
+      createResizeHandle(selectedObject, 'x', -1, new THREE.Vector3(center.x - half.x, center.y, center.z), new THREE.Vector3(-1, 0, 0)),
+      createResizeHandle(selectedObject, 'z', 1, new THREE.Vector3(center.x, center.y, center.z + half.z), new THREE.Vector3(0, 0, 1)),
+      createResizeHandle(selectedObject, 'z', -1, new THREE.Vector3(center.x, center.y, center.z - half.z), new THREE.Vector3(0, 0, -1)),
+      createResizeHandle(selectedObject, 'y', 1, new THREE.Vector3(center.x, center.y + half.y, center.z), new THREE.Vector3(0, 1, 0)),
+      createResizeHandle(selectedObject, 'y', -1, new THREE.Vector3(center.x, center.y - half.y, center.z), new THREE.Vector3(0, -1, 0))
     );
+  }
+
+  if (state.viewportTool === 'scale' && isGroupTarget) {
+    handleGroup.add(
+      createGroupResizeHandle(selectedGroup, 'x', 1, new THREE.Vector3(center.x + half.x, center.y, center.z)),
+      createGroupResizeHandle(selectedGroup, 'x', -1, new THREE.Vector3(center.x - half.x, center.y, center.z)),
+      createGroupResizeHandle(selectedGroup, 'z', 1, new THREE.Vector3(center.x, center.y, center.z + half.z)),
+      createGroupResizeHandle(selectedGroup, 'z', -1, new THREE.Vector3(center.x, center.y, center.z - half.z)),
+      createGroupResizeHandle(selectedGroup, 'y', 1, new THREE.Vector3(center.x, center.y + half.y, center.z)),
+      createGroupResizeHandle(selectedGroup, 'y', -1, new THREE.Vector3(center.x, center.y - half.y, center.z))
+    );
+  }
+
+  if (state.viewportTool === 'round' && !isGroupTarget && selectedObject?.type === 'tile') {
+    getRoundingHandleDefinitions().forEach((handleDefinition) => {
+      handleGroup.add(createRoundingHandle(selectedObject, handleDefinition, bounds));
+    });
   }
 
   if (handleGroup.children.length === 0) {
@@ -3296,7 +4516,7 @@ function syncProjectSceneToViewport() {
 function moveSelectedLight(action) {
   const selectedObject = getSelectedObject();
 
-  if (!selectedObject || selectedObject.type !== 'directional-light') {
+  if (!selectedObject || selectedObject.type !== 'directional-light' || isObjectEffectivelyLocked(selectedObject)) {
     return;
   }
 
@@ -3348,7 +4568,8 @@ function renderViewportToolButtons() {
     select: elements.viewportSelectToolButton,
     move: elements.viewportMoveToolButton,
     rotate: elements.viewportRotateToolButton,
-    scale: elements.viewportScaleToolButton
+    scale: elements.viewportScaleToolButton,
+    round: elements.viewportRoundToolButton
   };
 
   Object.entries(buttons).forEach(([tool, button]) => {
@@ -3360,6 +4581,59 @@ function renderViewportToolButtons() {
     button.classList.toggle('tool-active', isActive);
     button.setAttribute('aria-pressed', String(isActive));
   });
+
+  renderRoundingModeControls();
+}
+
+function getRoundingControlModeLabel(mode = state.roundingControlMode) {
+  if (mode === 'axis') {
+    return 'por eixo';
+  }
+
+  if (mode === 'all') {
+    return 'todas as bordas';
+  }
+
+  return '12 bordas';
+}
+
+function renderRoundingModeControls() {
+  const modeLabel = getRoundingControlModeLabel();
+
+  elements.viewportRoundToolButton.setAttribute('aria-label', `Arredondar bordas (${modeLabel})`);
+  elements.viewportRoundToolButton.setAttribute('title', `Arredondar bordas - ${modeLabel}`);
+
+  elements.viewportRoundModeButtons.forEach((button) => {
+    const isActive = button.dataset.roundingMode === state.roundingControlMode;
+    button.classList.toggle('rounding-mode-active', isActive);
+    button.setAttribute('aria-checked', String(isActive));
+  });
+}
+
+function openRoundingModeMenu() {
+  window.clearTimeout(roundingModeMenuCloseTimer);
+  elements.viewportRoundToolItem.classList.add('rounding-menu-open');
+  elements.viewportRoundToolButton.setAttribute('aria-expanded', 'true');
+}
+
+function closeRoundingModeMenu() {
+  window.clearTimeout(roundingModeMenuCloseTimer);
+  elements.viewportRoundToolItem.classList.remove('rounding-menu-open');
+  elements.viewportRoundToolButton.setAttribute('aria-expanded', 'false');
+}
+
+function scheduleRoundingModeMenuClose() {
+  window.clearTimeout(roundingModeMenuCloseTimer);
+  roundingModeMenuCloseTimer = window.setTimeout(closeRoundingModeMenu, 120);
+}
+
+function activateRoundingControlMode(mode) {
+  if (!roundingControlModes.has(mode)) {
+    return;
+  }
+
+  state.roundingControlMode = mode;
+  setViewportTool('round');
 }
 
 function setViewportTool(tool) {
@@ -3455,6 +4729,7 @@ function createTileObject(cellX, cellZ, name, material = getActiveTileMaterial()
       heightPixels: 1
     },
     material: cloneTileMaterial(material),
+    rounding: setAllRoundingEdges(0),
     visible: true,
     locked: false,
     moveSnap: true,
@@ -3529,6 +4804,11 @@ function removeTileAtCell(cellX, cellZ) {
 
 function removeTileObject(tileObject) {
   if (!state.activeProject || !tileObject) {
+    return;
+  }
+
+  if (isObjectEffectivelyLocked(tileObject)) {
+    showMessage('Tile bloqueado não pode ser removido.');
     return;
   }
 
@@ -3793,7 +5073,12 @@ function getTransformHandleTarget(event) {
 function getTransformHandleIntersection(event) {
   const target = getTransformHandleTarget(event);
   const userData = target?.userData || {};
-  const handle = userData.resizeHandle || userData.moveHandle || userData.rotateHandle || null;
+  const handle = userData.resizeHandle
+    || userData.groupResizeHandle
+    || userData.moveHandle
+    || userData.rotateHandle
+    || userData.roundingHandle
+    || null;
 
   return handle
     ? {
@@ -3916,6 +5201,11 @@ function snapRotationDegrees(value, object) {
   return Math.round(value / step) * step;
 }
 
+function snapGroupScale(value, group) {
+  const step = group.moveSnap === false ? 0.01 : 0.05;
+  return Math.round(value / step) * step;
+}
+
 function getResizedFaceCenter(startCenter, startUnits, nextUnits, side) {
   const fixedFace = side > 0
     ? startCenter - (startUnits / 2)
@@ -3941,7 +5231,307 @@ function updateTileGridPositionFromTransform(object) {
   ];
 }
 
+function getObjectPositionVector(object) {
+  const position = object.transform?.position || [0, 0, 0];
+  return new THREE.Vector3(position[0], position[1], position[2]);
+}
+
+function setObjectPositionFromVector(object, position) {
+  object.transform = {
+    ...object.transform,
+    position: [
+      Number(position.x.toFixed(3)),
+      Number(position.y.toFixed(3)),
+      Number(position.z.toFixed(3))
+    ],
+    rotation: object.transform?.rotation || [0, 0, 0],
+    scale: object.transform?.scale || [1, 1, 1]
+  };
+  updateTileGridPositionFromTransform(object);
+}
+
+function getAxisVectorByIndex(axisIndex) {
+  if (axisIndex === 0) {
+    return new THREE.Vector3(1, 0, 0);
+  }
+
+  if (axisIndex === 1) {
+    return new THREE.Vector3(0, 1, 0);
+  }
+
+  return new THREE.Vector3(0, 0, 1);
+}
+
+function getTransformAxisIndex(axis) {
+  return axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+}
+
+function cloneGroupObjectTransforms(group) {
+  return getGroupObjects(group).map((object) => ({
+    id: object.id,
+    position: getObjectPositionVector(object),
+    rotation: [...(object.transform?.rotation || [0, 0, 0])],
+    scale: [...(object.transform?.scale || [1, 1, 1])],
+    size: object.size ? { ...object.size } : null
+  }));
+}
+
+function moveGroupByDelta(group, delta) {
+  const deltaVector = new THREE.Vector3(delta[0], delta[1], delta[2]);
+
+  getGroupObjects(group).forEach((object) => {
+    setObjectPositionFromVector(object, getObjectPositionVector(object).add(deltaVector));
+  });
+
+  const bounds = getGroupTransformBounds(group);
+  group.transform = {
+    ...group.transform,
+    position: [
+      Number(bounds.center.x.toFixed(3)),
+      Number(bounds.center.y.toFixed(3)),
+      Number(bounds.center.z.toFixed(3))
+    ]
+  };
+}
+
+function applyGroupMoveFromStart(group, startObjects, delta) {
+  const deltaVector = new THREE.Vector3(delta[0], delta[1], delta[2]);
+
+  startObjects.forEach((startObject) => {
+    const object = getObjectById(startObject.id);
+
+    if (!object) {
+      return;
+    }
+
+    setObjectPositionFromVector(object, startObject.position.clone().add(deltaVector));
+  });
+
+  const bounds = getGroupTransformBounds(group);
+  group.transform = {
+    ...group.transform,
+    position: [
+      Number(bounds.center.x.toFixed(3)),
+      Number(bounds.center.y.toFixed(3)),
+      Number(bounds.center.z.toFixed(3))
+    ]
+  };
+}
+
+function rotateGroupByDelta(group, axisIndex, deltaDegrees, center) {
+  const radians = THREE.MathUtils.degToRad(deltaDegrees);
+  const axis = getAxisVectorByIndex(axisIndex);
+
+  getGroupObjects(group).forEach((object) => {
+    const nextPosition = getObjectPositionVector(object).sub(center).applyAxisAngle(axis, radians).add(center);
+    const rotation = [...(object.transform?.rotation || [0, 0, 0])];
+    rotation[axisIndex] = Number((rotationOrZero(rotation[axisIndex]) + deltaDegrees).toFixed(3));
+    setObjectPositionFromVector(object, nextPosition);
+    object.transform.rotation = rotation;
+  });
+
+  const bounds = getGroupTransformBounds(group);
+  group.transform = {
+    ...group.transform,
+    position: [
+      Number(bounds.center.x.toFixed(3)),
+      Number(bounds.center.y.toFixed(3)),
+      Number(bounds.center.z.toFixed(3))
+    ]
+  };
+}
+
+function applyGroupRotationFromStart(group, startObjects, center, axisIndex, deltaDegrees) {
+  const radians = THREE.MathUtils.degToRad(deltaDegrees);
+  const axis = getAxisVectorByIndex(axisIndex);
+
+  startObjects.forEach((startObject) => {
+    const object = getObjectById(startObject.id);
+
+    if (!object) {
+      return;
+    }
+
+    const nextPosition = startObject.position.clone().sub(center).applyAxisAngle(axis, radians).add(center);
+    const rotation = [...startObject.rotation];
+    rotation[axisIndex] = Number((rotationOrZero(rotation[axisIndex]) + deltaDegrees).toFixed(3));
+    setObjectPositionFromVector(object, nextPosition);
+    object.transform.rotation = rotation;
+  });
+
+  getGroupTransformBounds(group);
+}
+
+function scaleGroupTo(group, nextScale, center) {
+  const currentScale = getGroupScale(group);
+  const scaleFactor = nextScale / currentScale;
+
+  getGroupObjects(group).forEach((object) => {
+    const nextPosition = getObjectPositionVector(object).sub(center).multiplyScalar(scaleFactor).add(center);
+    const objectScale = object.transform?.scale || [1, 1, 1];
+    const nextObjectScale = objectScale.map((value) => Math.max(0.01, Number(value || 1) * scaleFactor));
+    setObjectPositionFromVector(object, nextPosition);
+    object.transform.scale = nextObjectScale;
+  });
+
+  group.transform = {
+    ...group.transform,
+    scale: [nextScale, nextScale, nextScale]
+  };
+  getGroupTransformBounds(group);
+}
+
+function applyGroupScaleFromStart(group, startObjects, center, nextScale, startScale) {
+  const scaleFactor = nextScale / startScale;
+
+  startObjects.forEach((startObject) => {
+    const object = getObjectById(startObject.id);
+
+    if (!object) {
+      return;
+    }
+
+    const nextPosition = startObject.position.clone().sub(center).multiplyScalar(scaleFactor).add(center);
+    const nextObjectScale = startObject.scale.map((value) => Math.max(0.01, Number(value || 1) * scaleFactor));
+    setObjectPositionFromVector(object, nextPosition);
+    object.transform.scale = nextObjectScale;
+  });
+
+  group.transform = {
+    ...group.transform,
+    scale: [nextScale, nextScale, nextScale]
+  };
+  getGroupTransformBounds(group);
+}
+
+function getGroupResizeStepUnits(group) {
+  const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
+  return group.resizeSnap === false ? 1 / tileSizePixels : 0.25;
+}
+
+function snapGroupResizeUnits(value, group, minimumUnits) {
+  const step = getGroupResizeStepUnits(group);
+  const minUnits = Number.isFinite(minimumUnits) ? minimumUnits : step;
+
+  if (value <= minUnits) {
+    return minUnits;
+  }
+
+  return Math.max(minUnits, Math.round(value / step) * step);
+}
+
+function getGroupResizeMinimumUnits(axis) {
+  if (axis === 'y') {
+    const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
+    return getTileHeightUnits(tileSizePixels, 1);
+  }
+
+  return 1;
+}
+
+function getGroupResizePointerDelta(event, drag) {
+  if (drag.axis === 'x' || drag.axis === 'z') {
+    const currentGroundPoint = getGroundPointFromPointerEvent(event);
+
+    if (!currentGroundPoint || !drag.startGroundPoint) {
+      return null;
+    }
+
+    return drag.axis === 'x'
+      ? currentGroundPoint.x - drag.startGroundPoint.x
+      : currentGroundPoint.z - drag.startGroundPoint.z;
+  }
+
+  return (drag.startClientY - event.clientY) / 80;
+}
+
+function resizeTileAxisFromStart(object, startObject, axis, factor, fixedFace) {
+  if (!startObject.size) {
+    return;
+  }
+
+  const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
+  const nextSize = { ...startObject.size };
+
+  if (axis === 'x') {
+    const startWidthUnits = (startObject.size.widthPixels || tileSizePixels) / tileSizePixels;
+    nextSize.widthPixels = Math.max(tileSizePixels, Math.round(startWidthUnits * factor * tileSizePixels));
+  }
+
+  if (axis === 'z') {
+    const startDepthUnits = (startObject.size.depthPixels || tileSizePixels) / tileSizePixels;
+    nextSize.depthPixels = Math.max(tileSizePixels, Math.round(startDepthUnits * factor * tileSizePixels));
+  }
+
+  if (axis === 'y') {
+    const startHeightUnits = getTileHeightUnits(tileSizePixels, startObject.size.heightPixels || 1);
+    nextSize.heightPixels = getTileHeightPixelsFromUnits(startHeightUnits * factor, tileSizePixels);
+  }
+
+  object.size = nextSize;
+
+  const nextPosition = startObject.position.clone();
+  nextPosition[axis] = fixedFace + ((startObject.position[axis] - fixedFace) * factor);
+  setObjectPositionFromVector(object, nextPosition);
+}
+
+function applyGroupResizeFromStart(group, startObjects, axis, side, startCenter, startUnits, nextUnits) {
+  const factor = nextUnits / startUnits;
+  const fixedFace = side > 0
+    ? startCenter[axis] - (startUnits / 2)
+    : startCenter[axis] + (startUnits / 2);
+
+  startObjects.forEach((startObject) => {
+    const object = getObjectById(startObject.id);
+
+    if (!object) {
+      return;
+    }
+
+    if (object.type === 'tile') {
+      resizeTileAxisFromStart(object, startObject, axis, factor, fixedFace);
+      return;
+    }
+
+    const nextPosition = startObject.position.clone();
+    nextPosition[axis] = fixedFace + ((startObject.position[axis] - fixedFace) * factor);
+    setObjectPositionFromVector(object, nextPosition);
+  });
+
+  const bounds = getGroupTransformBounds(group);
+  group.transform = {
+    ...group.transform,
+    position: [
+      Number(bounds.center.x.toFixed(3)),
+      Number(bounds.center.y.toFixed(3)),
+      Number(bounds.center.z.toFixed(3))
+    ]
+  };
+}
+
 function beginObjectMove(event, handle) {
+  if (handle.targetType === 'group') {
+    const group = getGroupById(handle.groupId);
+
+    if (!group || getGroupLocked(group)) {
+      return false;
+    }
+
+    viewportInteraction.moveDrag = {
+      ...handle,
+      startClientY: event.clientY,
+      startGroundPoint: getGroundPointFromPointerEvent(event),
+      startObjects: cloneGroupObjectTransforms(group)
+    };
+
+    if (viewport.controls) {
+      viewport.controls.enabled = false;
+    }
+
+    elements.sceneViewport.setPointerCapture(event.pointerId);
+    return true;
+  }
+
   const object = getObjectById(handle.objectId);
 
   if (!object || isObjectEffectivelyLocked(object)) {
@@ -3967,6 +5557,41 @@ function updateObjectMove(event) {
   const drag = viewportInteraction.moveDrag;
 
   if (!drag) {
+    return;
+  }
+
+  if (drag.targetType === 'group') {
+    const group = getGroupById(drag.groupId);
+
+    if (!group || getGroupLocked(group)) {
+      return;
+    }
+
+    const delta = [0, 0, 0];
+
+    if (drag.axis === 'x' || drag.axis === 'z') {
+      const currentGroundPoint = getGroundPointFromPointerEvent(event);
+
+      if (!currentGroundPoint || !drag.startGroundPoint) {
+        return;
+      }
+
+      const pointerDelta = drag.axis === 'x'
+        ? currentGroundPoint.x - drag.startGroundPoint.x
+        : currentGroundPoint.z - drag.startGroundPoint.z;
+      const nextDelta = snapMoveDeltaUnits(pointerDelta, group);
+      delta[drag.axis === 'x' ? 0 : 2] = nextDelta;
+    }
+
+    if (drag.axis === 'y') {
+      const pointerDelta = (drag.startClientY - event.clientY) / 80;
+      delta[1] = snapMoveDeltaUnits(pointerDelta, group);
+    }
+
+    applyGroupMoveFromStart(group, drag.startObjects, delta);
+    syncProjectSceneToViewport();
+    renderPropertiesPanel();
+    markEditorDirty();
     return;
   }
 
@@ -4025,6 +5650,30 @@ function endObjectMove(event) {
 }
 
 function beginObjectRotate(event, handle) {
+  if (handle.targetType === 'group') {
+    const group = getGroupById(handle.groupId);
+
+    if (!group || getGroupLocked(group)) {
+      return false;
+    }
+
+    viewportInteraction.rotateDrag = {
+      ...handle,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startCenter: getGroupTransformBounds(group).center.clone(),
+      startObjects: cloneGroupObjectTransforms(group),
+      startRotation: [...(group.transform?.rotation || [0, 0, 0])]
+    };
+
+    if (viewport.controls) {
+      viewport.controls.enabled = false;
+    }
+
+    elements.sceneViewport.setPointerCapture(event.pointerId);
+    return true;
+  }
+
   const object = getObjectById(handle.objectId);
 
   if (!object || isObjectEffectivelyLocked(object)) {
@@ -4050,6 +5699,36 @@ function updateObjectRotate(event) {
   const drag = viewportInteraction.rotateDrag;
 
   if (!drag) {
+    return;
+  }
+
+  if (drag.targetType === 'group') {
+    const group = getGroupById(drag.groupId);
+
+    if (!group || getGroupLocked(group)) {
+      return;
+    }
+
+    const axisIndex = drag.axis === 'x' ? 0 : drag.axis === 'y' ? 1 : 2;
+    const pointerDelta = (event.clientX - drag.startClientX) + (drag.startClientY - event.clientY);
+    const nextRotation = rotationOrZero(drag.startRotation[axisIndex]) + (pointerDelta * 0.5);
+    const snappedRotation = Number(snapRotationDegrees(nextRotation, group).toFixed(3));
+    const rotation = [...drag.startRotation];
+    rotation[axisIndex] = snappedRotation;
+    group.transform = {
+      ...group.transform,
+      rotation
+    };
+    applyGroupRotationFromStart(
+      group,
+      drag.startObjects,
+      drag.startCenter,
+      axisIndex,
+      snappedRotation - rotationOrZero(drag.startRotation[axisIndex])
+    );
+    syncProjectSceneToViewport();
+    renderPropertiesPanel();
+    markEditorDirty();
     return;
   }
 
@@ -4080,6 +5759,173 @@ function endObjectRotate(event) {
   }
 
   viewportInteraction.rotateDrag = null;
+
+  if (elements.sceneViewport.hasPointerCapture(event.pointerId)) {
+    elements.sceneViewport.releasePointerCapture(event.pointerId);
+  }
+
+  if (viewport.controls) {
+    configureViewportControlsForTool();
+  }
+}
+
+function projectWorldToViewportPoint(worldPoint) {
+  const rect = elements.sceneViewport.getBoundingClientRect();
+  const projected = worldPoint.clone().project(viewport.camera);
+
+  return new THREE.Vector2(
+    ((projected.x + 1) / 2) * rect.width,
+    ((1 - projected.y) / 2) * rect.height
+  );
+}
+
+function beginRoundingDrag(event, handle) {
+  const object = getObjectById(handle.objectId);
+  const edgeIds = Array.isArray(handle.edgeIds)
+    ? handle.edgeIds.filter((edgeId) => roundingEdgeIds.includes(edgeId))
+    : [handle.edgeId].filter((edgeId) => roundingEdgeIds.includes(edgeId));
+
+  if (!object || object.type !== 'tile' || edgeIds.length === 0 || isObjectEffectivelyLocked(object)) {
+    return false;
+  }
+
+  const bounds = getSelectedTransformBounds(object);
+  const basis = getRoundingHandleBasis(handle, bounds);
+
+  if (!basis) {
+    return false;
+  }
+
+  const { origin, direction } = basis;
+  const originScreen = projectWorldToViewportPoint(origin);
+  const tipScreen = projectWorldToViewportPoint(origin.clone().add(direction));
+  const screenDirection = tipScreen.clone().sub(originScreen);
+
+  if (screenDirection.lengthSq() < 0.0001) {
+    screenDirection.set(0, -1);
+  } else {
+    screenDirection.normalize();
+  }
+
+  viewportInteraction.roundDrag = {
+    ...handle,
+    edgeIds,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startValue: getRoundingEdgesAveragePercent(object.rounding, edgeIds),
+    screenDirection
+  };
+
+  if (viewport.controls) {
+    viewport.controls.enabled = false;
+  }
+
+  elements.sceneViewport.setPointerCapture(event.pointerId);
+  return true;
+}
+
+function updateRoundingDrag(event) {
+  const drag = viewportInteraction.roundDrag;
+
+  if (!drag) {
+    return;
+  }
+
+  const object = getObjectById(drag.objectId);
+
+  if (!object || object.type !== 'tile' || isObjectEffectivelyLocked(object)) {
+    return;
+  }
+
+  const delta = new THREE.Vector2(
+    event.clientX - drag.startClientX,
+    event.clientY - drag.startClientY
+  );
+  const nextValue = drag.startValue + (delta.dot(drag.screenDirection) * 0.45);
+
+  object.rounding = setRoundingEdgeValues(object.rounding, drag.edgeIds, nextValue);
+  syncProjectSceneToViewport();
+  renderPropertiesPanel();
+  markEditorDirty();
+}
+
+function endRoundingDrag(event) {
+  if (!viewportInteraction.roundDrag) {
+    return;
+  }
+
+  viewportInteraction.roundDrag = null;
+
+  if (elements.sceneViewport.hasPointerCapture(event.pointerId)) {
+    elements.sceneViewport.releasePointerCapture(event.pointerId);
+  }
+
+  if (viewport.controls) {
+    configureViewportControlsForTool();
+  }
+}
+
+function beginGroupResize(event, handle) {
+  const group = getGroupById(handle.groupId);
+
+  if (!group || getGroupLocked(group)) {
+    return false;
+  }
+
+  const bounds = getGroupTransformBounds(group);
+
+  viewportInteraction.groupResizeDrag = {
+    ...handle,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startGroundPoint: getGroundPointFromPointerEvent(event),
+    startCenter: bounds.center.clone(),
+    startUnits: Math.max(bounds.half[handle.axis] * 2, getGroupResizeMinimumUnits(handle.axis)),
+    startObjects: cloneGroupObjectTransforms(group),
+  };
+
+  if (viewport.controls) {
+    viewport.controls.enabled = false;
+  }
+
+  elements.sceneViewport.setPointerCapture(event.pointerId);
+  return true;
+}
+
+function updateGroupResize(event) {
+  const drag = viewportInteraction.groupResizeDrag;
+
+  if (!drag) {
+    return;
+  }
+
+  const group = getGroupById(drag.groupId);
+
+  if (!group || getGroupLocked(group)) {
+    return;
+  }
+
+  const pointerDelta = getGroupResizePointerDelta(event, drag);
+
+  if (pointerDelta === null) {
+    return;
+  }
+
+  const minimumUnits = getGroupResizeMinimumUnits(drag.axis);
+  const nextUnits = snapGroupResizeUnits(drag.startUnits + (pointerDelta * drag.side), group, minimumUnits);
+
+  applyGroupResizeFromStart(group, drag.startObjects, drag.axis, drag.side, drag.startCenter, drag.startUnits, nextUnits);
+  syncProjectSceneToViewport();
+  renderPropertiesPanel();
+  markEditorDirty();
+}
+
+function endGroupResize(event) {
+  if (!viewportInteraction.groupResizeDrag) {
+    return;
+  }
+
+  viewportInteraction.groupResizeDrag = null;
 
   if (elements.sceneViewport.hasPointerCapture(event.pointerId)) {
     elements.sceneViewport.releasePointerCapture(event.pointerId);
@@ -4294,6 +6140,16 @@ function handleViewportPointerDown(event) {
     event.preventDefault();
     viewportInteraction.selectionClick = null;
 
+    if (transformHandle.targetType === 'group' && transformHandle.side !== undefined && transformHandle.axis && state.viewportTool === 'scale') {
+      beginGroupResize(event, transformHandle);
+      return;
+    }
+
+    if (transformHandle.roundingHandleId && state.viewportTool === 'round') {
+      beginRoundingDrag(event, transformHandle);
+      return;
+    }
+
     if (transformHandle.side !== undefined && transformHandle.axis && state.viewportTool === 'scale') {
       beginTileResize(event, transformHandle);
       return;
@@ -4377,6 +6233,18 @@ function handleViewportPointerDown(event) {
 }
 
 function handleViewportPointerMove(event) {
+  if (viewportInteraction.roundDrag) {
+    event.preventDefault();
+    updateRoundingDrag(event);
+    return;
+  }
+
+  if (viewportInteraction.groupResizeDrag) {
+    event.preventDefault();
+    updateGroupResize(event);
+    return;
+  }
+
   if (viewportInteraction.resizeDrag) {
     event.preventDefault();
     updateTileResize(event);
@@ -4417,6 +6285,16 @@ function handleViewportPointerMove(event) {
 }
 
 function handleViewportPointerUp(event) {
+  if (viewportInteraction.roundDrag) {
+    endRoundingDrag(event);
+    return;
+  }
+
+  if (viewportInteraction.groupResizeDrag) {
+    endGroupResize(event);
+    return;
+  }
+
   if (viewportInteraction.resizeDrag) {
     endTileResize(event);
     return;
@@ -4450,7 +6328,7 @@ function handleViewportPointerUp(event) {
 }
 
 function handleViewportPointerLeave() {
-  if (viewportInteraction.resizeDrag || viewportInteraction.moveDrag || viewportInteraction.rotateDrag) {
+  if (viewportInteraction.resizeDrag || viewportInteraction.moveDrag || viewportInteraction.rotateDrag || viewportInteraction.groupResizeDrag || viewportInteraction.roundDrag) {
     return;
   }
 
@@ -4470,7 +6348,8 @@ function handleViewportContextMenu(event) {
 function isEditorModalOpen() {
   return !elements.newProjectModal.hidden
     || !elements.renameProjectModal.hidden
-    || !elements.deleteProjectModal.hidden;
+    || !elements.deleteProjectModal.hidden
+    || !elements.deleteTilesetModal.hidden;
 }
 
 function isEditableEventTarget(target) {
@@ -4727,6 +6606,7 @@ function resizeViewport() {
   viewport.camera.updateProjectionMatrix();
   viewport.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   viewport.renderer.setSize(clientWidth, clientHeight, false);
+  resizeAxisGizmo();
 }
 
 function setSidebarCollapsed(side, isCollapsed) {
@@ -4789,6 +6669,13 @@ elements.deleteProjectModal.addEventListener('click', (event) => {
     closeDeleteProjectModal();
   }
 });
+elements.deleteTilesetForm.addEventListener('submit', deleteTilesetFromModal);
+elements.cancelDeleteTilesetButton.addEventListener('click', closeDeleteTilesetModal);
+elements.deleteTilesetModal.addEventListener('click', (event) => {
+  if (event.target === elements.deleteTilesetModal) {
+    closeDeleteTilesetModal();
+  }
+});
 elements.propertyFields.addEventListener('click', (event) => {
   const actionButton = event.target.closest('button[data-light-action]');
 
@@ -4825,9 +6712,46 @@ elements.propertyFields.addEventListener('change', (event) => {
   const resizeSnapInput = event.target.closest('input[data-tile-resize-snap]');
   const moveSnapInput = event.target.closest('input[data-object-move-snap]');
   const rotateSnapInput = event.target.closest('input[data-object-rotate-snap]');
+  const selectedGroup = getSelectedGroup();
   const selectedObject = getSelectedObject();
 
+  if (selectedGroup) {
+    if (getGroupLocked(selectedGroup)) {
+      renderPropertiesPanel();
+      return;
+    }
+
+    if (propertyInput) {
+      updateSelectedNumericProperty(propertyInput);
+      return;
+    }
+
+    if (resizeSnapInput) {
+      selectedGroup.resizeSnap = resizeSnapInput.checked;
+      markEditorDirty();
+      return;
+    }
+
+    if (moveSnapInput) {
+      selectedGroup.moveSnap = moveSnapInput.checked;
+      markEditorDirty();
+      return;
+    }
+
+    if (rotateSnapInput) {
+      selectedGroup.rotateSnap = rotateSnapInput.checked;
+      markEditorDirty();
+    }
+
+    return;
+  }
+
   if (!selectedObject) {
+    return;
+  }
+
+  if (isObjectEffectivelyLocked(selectedObject)) {
+    renderPropertiesPanel();
     return;
   }
 
@@ -4853,15 +6777,8 @@ elements.propertyFields.addEventListener('change', (event) => {
     markEditorDirty();
   }
 });
-elements.axisGizmo.addEventListener('click', (event) => {
-  const axisButton = event.target.closest('button[data-axis][data-sign]');
-
-  if (!axisButton) {
-    return;
-  }
-
-  focusCameraOnAxis(axisButton.dataset.axis, Number(axisButton.dataset.sign));
-});
+elements.axisGizmo.addEventListener('click', handleAxisGizmoClick);
+elements.axisGizmo.addEventListener('keydown', handleAxisGizmoKeydown);
 elements.tileColorPicker.addEventListener('input', () => {
   const color = normalizeHexColor(elements.tileColorPicker.value);
   const targetIndex = state.customColorTargetIndex;
@@ -4938,6 +6855,24 @@ elements.viewportSelectToolButton.addEventListener('click', () => setViewportToo
 elements.viewportMoveToolButton.addEventListener('click', () => setViewportTool('move'));
 elements.viewportRotateToolButton.addEventListener('click', () => setViewportTool('rotate'));
 elements.viewportScaleToolButton.addEventListener('click', () => setViewportTool('scale'));
+elements.viewportRoundToolItem.addEventListener('pointerenter', openRoundingModeMenu);
+elements.viewportRoundToolItem.addEventListener('pointerleave', scheduleRoundingModeMenuClose);
+elements.viewportRoundToolItem.addEventListener('focusin', openRoundingModeMenu);
+elements.viewportRoundToolItem.addEventListener('focusout', (event) => {
+  if (!elements.viewportRoundToolItem.contains(event.relatedTarget)) {
+    scheduleRoundingModeMenuClose();
+  }
+});
+elements.viewportRoundToolButton.addEventListener('click', () => {
+  openRoundingModeMenu();
+  setViewportTool('round');
+});
+elements.viewportRoundModeButtons.forEach((button) => {
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    activateRoundingControlMode(button.dataset.roundingMode);
+  });
+});
 elements.stampToolButton.addEventListener('click', activateTilePaintTool);
 elements.bucketToolButton.addEventListener('click', activateBucketFillTool);
 elements.addTileButton.addEventListener('click', activateTilePaintTool);
@@ -4984,6 +6919,10 @@ document.addEventListener('keydown', (event) => {
 
     if (!elements.deleteProjectModal.hidden) {
       closeDeleteProjectModal();
+    }
+
+    if (!elements.deleteTilesetModal.hidden) {
+      closeDeleteTilesetModal();
     }
   }
 
