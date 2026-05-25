@@ -865,6 +865,10 @@ button {
   justify-self: end;
 }
 
+.editor-panel-tools .editor-tool-button {
+  border-radius: var(--md-sys-shape-corner-small);
+}
+
 .editor-tool-button {
   display: grid;
   place-items: center;
