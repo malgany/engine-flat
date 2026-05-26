@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const state = {
   recentProjects: [],
@@ -30,7 +32,12 @@ const state = {
   customColorTargetIndex: null,
   activeTool: 'select',
   viewportTool: 'select',
-  roundingControlMode: 'edge'
+  roundingControlMode: 'edge',
+  propertyAccordionOpenKey: 'basic',
+  textureTool: 'bucket',
+  texturePaintColor: '#9aa0a6',
+  textureBrushSize: 14,
+  textureZoom: 0.5
 };
 
 const viewport = {
@@ -43,6 +50,9 @@ const viewport = {
   objectGroup: null,
   sceneObjectMeshes: new Map(),
   textureCache: new Map(),
+  paintCanvasCache: new Map(),
+  paintTextureCache: new Map(),
+  modelCache: new Map(),
   imageCache: new Map(),
   sceneLight: null,
   lightMarker: null,
@@ -70,8 +80,16 @@ const viewportInteraction = {
   moveDrag: null,
   rotateDrag: null,
   roundDrag: null,
+  shapeDrag: null,
   groupResizeDrag: null,
   selectionClick: null
+};
+
+const textureInteraction = {
+  isPainting: false,
+  objectId: null,
+  lastPoint: null,
+  activeRegion: null
 };
 
 viewportInteraction.raycaster.params.Line.threshold = 0.08;
@@ -88,13 +106,26 @@ const projectThumbnailHeightPixels = 180;
 const projectThumbnailQuality = 0.72;
 const defaultTileColor = '#9aa0a6';
 const defaultTilesetId = 'colors';
+const defaultPaintTextureSize = 512;
+const paintTextureVersion = 1;
+const textureZoomMin = 0.25;
+const textureZoomMax = 6;
+const textureZoomStep = 1.25;
 const roundingControlModes = new Set(['edge', 'axis', 'all']);
 const roundingHandleMinPercent = 0;
 const roundingHandleMaxPercent = 100;
 const roundingGeometrySegments = 14;
+const shapeTaperMinPercent = 0;
+const shapeTaperMaxPercent = 100;
+const shapeSidesMin = 3;
+const shapeSidesMax = 32;
 const tilePaletteColors = createDefaultTilePalette();
 const roundingEdgeDefinitions = createRoundingEdgeDefinitions();
 const roundingEdgeIds = roundingEdgeDefinitions.map((edge) => edge.id);
+const shapeFaceDefinitions = createShapeFaceDefinitions();
+const shapeFaceIds = shapeFaceDefinitions.map((face) => face.id);
+const gltfLoader = new GLTFLoader();
+const objLoader = new OBJLoader();
 let roundingModeMenuCloseTimer = null;
 
 const elements = {
@@ -124,16 +155,32 @@ const elements = {
   viewportRoundToolButton: document.querySelector('#viewportRoundToolButton'),
   viewportRoundModeMenu: document.querySelector('#viewportRoundModeMenu'),
   viewportRoundModeButtons: [...document.querySelectorAll('[data-rounding-mode]')],
+  viewportShapeToolButton: document.querySelector('#viewportShapeToolButton'),
   axisGizmoCanvas: document.querySelector('#axisGizmoCanvas'),
   stampToolButton: document.querySelector('#stampToolButton'),
   bucketToolButton: document.querySelector('#bucketToolButton'),
   addTileButton: document.querySelector('#addTileButton'),
+  addSphereButton: document.querySelector('#addSphereButton'),
+  importModelButton: document.querySelector('#importModelButton'),
   propertyFields: document.querySelector('#propertyFields'),
   selectedObjectName: document.querySelector('#selectedObjectName'),
+  textureObjectName: document.querySelector('#textureObjectName'),
+  textureBucketToolButton: document.querySelector('#textureBucketToolButton'),
+  textureBrushToolButton: document.querySelector('#textureBrushToolButton'),
+  textureEraserToolButton: document.querySelector('#textureEraserToolButton'),
+  textureColorPicker: document.querySelector('#textureColorPicker'),
+  textureBrushSizeInput: document.querySelector('#textureBrushSizeInput'),
+  textureZoomOutButton: document.querySelector('#textureZoomOutButton'),
+  textureZoomInButton: document.querySelector('#textureZoomInButton'),
+  textureCanvasScroll: document.querySelector('#textureCanvasScroll'),
+  textureCanvasStage: document.querySelector('#textureCanvasStage'),
+  textureCanvas: document.querySelector('#textureCanvas'),
+  textureEmptyMessage: document.querySelector('#textureEmptyMessage'),
   tileStyleName: document.querySelector('#tileStyleName'),
   tileSetTabs: document.querySelector('#tileSetTabs'),
   tileSetContent: document.querySelector('#tileSetContent'),
   tileSetImageInput: document.querySelector('#tileSetImageInput'),
+  modelImportInput: document.querySelector('#modelImportInput'),
   tileColorPicker: document.querySelector('#tileColorPicker'),
   collapseLeftPanelsButton: document.querySelector('#collapseLeftPanelsButton'),
   collapseRightPanelsButton: document.querySelector('#collapseRightPanelsButton'),
@@ -234,6 +281,78 @@ function cloneTileMaterial(material) {
   return cloneJson(normalizeTileMaterial(material));
 }
 
+function isPaintableObjectType(type) {
+  return type === 'tile' || type === 'sphere' || type === 'model';
+}
+
+function getDefaultTextureLayoutType(objectOrType) {
+  const type = typeof objectOrType === 'string' ? objectOrType : objectOrType?.type;
+
+  if (type === 'sphere') {
+    return 'sphere-equirect';
+  }
+
+  if (type === 'model') {
+    return 'uv';
+  }
+
+  return 'box';
+}
+
+function normalizeTexturePaint(texturePaint = {}, layoutType = 'box') {
+  const defaultDimensions = getDefaultPaintTextureDimensions(layoutType);
+  const width = Number.parseInt(texturePaint.width, 10);
+  const height = Number.parseInt(texturePaint.height, 10);
+
+  return {
+    version: paintTextureVersion,
+    width: Number.isFinite(width) && width > 0 ? width : defaultDimensions.width,
+    height: Number.isFinite(height) && height > 0 ? height : defaultDimensions.height,
+    imageDataUrl: typeof texturePaint.imageDataUrl === 'string' ? texturePaint.imageDataUrl : '',
+    layoutType: String(texturePaint.layoutType || layoutType)
+  };
+}
+
+function getDefaultPaintTextureDimensions(layoutType = 'box') {
+  if (layoutType === 'sphere-equirect') {
+    return {
+      width: defaultPaintTextureSize,
+      height: defaultPaintTextureSize / 2
+    };
+  }
+
+  return {
+    width: defaultPaintTextureSize,
+    height: defaultPaintTextureSize
+  };
+}
+
+function normalizeSourceModel(sourceModel = {}) {
+  return {
+    name: String(sourceModel.name || 'Modelo importado'),
+    format: String(sourceModel.format || '').toLowerCase(),
+    dataUrl: String(sourceModel.dataUrl || '')
+  };
+}
+
+function isSupportedSceneObjectType(type) {
+  return type === 'directional-light' || type === 'tile' || type === 'sphere' || type === 'model';
+}
+
+function getObjectMaterialColor(object) {
+  if (object?.type === 'tile') {
+    return getTileMaterialPreviewColor(object.material);
+  }
+
+  return normalizeHexColor(object?.material?.color || defaultTileColor);
+}
+
+function clonePaintableMaterial(material = {}) {
+  return {
+    color: normalizeHexColor(material.color || defaultTileColor)
+  };
+}
+
 function componentToHex(value) {
   return Math.round(value).toString(16).padStart(2, '0');
 }
@@ -332,6 +451,17 @@ function createRoundingEdgeDefinitions() {
   });
 }
 
+function createShapeFaceDefinitions() {
+  return [
+    { id: 'y_pos', axis: 'y', sign: 1, label: 'Topo' },
+    { id: 'y_neg', axis: 'y', sign: -1, label: 'Base' },
+    { id: 'x_pos', axis: 'x', sign: 1, label: 'Direita' },
+    { id: 'x_neg', axis: 'x', sign: -1, label: 'Esquerda' },
+    { id: 'z_pos', axis: 'z', sign: 1, label: 'Frente' },
+    { id: 'z_neg', axis: 'z', sign: -1, label: 'Fundo' }
+  ];
+}
+
 function clampRoundingPercent(value) {
   const numericValue = Number(value);
 
@@ -420,6 +550,111 @@ function hasTileRounding(rounding) {
   return roundingEdgeIds.some((edgeId) => normalizedRounding.edges[edgeId] > 0);
 }
 
+function clampShapeTaperPercent(value) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return 0;
+  }
+
+  return Math.min(shapeTaperMaxPercent, Math.max(shapeTaperMinPercent, numericValue));
+}
+
+function clampShapeSides(value) {
+  const numericValue = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(numericValue)) {
+    return 4;
+  }
+
+  return Math.min(shapeSidesMax, Math.max(shapeSidesMin, numericValue));
+}
+
+function normalizeTileShape(shape = {}) {
+  let taperPercent = Number(shape.taperPercent);
+
+  if (!Number.isFinite(taperPercent) && Number.isFinite(Number(shape.topScalePercent))) {
+    taperPercent = 100 - Number(shape.topScalePercent);
+  }
+
+  if (!Number.isFinite(taperPercent) && Number.isFinite(Number(shape.topScale))) {
+    const topScale = Number(shape.topScale);
+    taperPercent = topScale <= 1 ? (1 - topScale) * 100 : 100 - topScale;
+  }
+
+  const sourceFaces = shape.faces || shape.faceTapers || {};
+  const hasFaces = shapeFaceIds.some((faceId) => sourceFaces[faceId] !== undefined);
+  const faces = {};
+
+  shapeFaceIds.forEach((faceId) => {
+    faces[faceId] = clampShapeTaperPercent(sourceFaces[faceId]);
+  });
+
+  if (!hasFaces && Number.isFinite(taperPercent)) {
+    faces.y_pos = clampShapeTaperPercent(taperPercent);
+  }
+
+  return {
+    type: 'taper',
+    sides: clampShapeSides(shape.sides),
+    faces,
+    taperPercent: getShapeFacesAveragePercent({ faces })
+  };
+}
+
+function cloneTileShape(shape) {
+  return cloneJson(normalizeTileShape(shape));
+}
+
+function setTileShapeValue(shape, propertyKey, value) {
+  const normalizedShape = normalizeTileShape(shape);
+
+  if (propertyKey === 'shape-all' || propertyKey === 'shape-taper') {
+    return setAllShapeFaces(normalizedShape, value);
+  } else if (propertyKey === 'shape-sides') {
+    normalizedShape.sides = clampShapeSides(value);
+  } else if (propertyKey.startsWith('shape-face-')) {
+    const faceId = propertyKey.slice('shape-face-'.length);
+
+    if (shapeFaceIds.includes(faceId)) {
+      normalizedShape.faces[faceId] = clampShapeTaperPercent(value);
+      normalizedShape.taperPercent = getShapeFacesAveragePercent(normalizedShape);
+    }
+  }
+
+  return normalizedShape;
+}
+
+function setAllShapeFaces(shape, value) {
+  const normalizedShape = normalizeTileShape(shape);
+  const nextValue = clampShapeTaperPercent(value);
+
+  shapeFaceIds.forEach((faceId) => {
+    normalizedShape.faces[faceId] = nextValue;
+  });
+
+  normalizedShape.taperPercent = nextValue;
+  return normalizedShape;
+}
+
+function getShapeFaceValue(shape, faceId) {
+  return clampShapeTaperPercent(normalizeTileShape(shape).faces[faceId]);
+}
+
+function getShapeFacesAveragePercent(shape) {
+  const sourceFaces = shape.faces || {};
+  const total = shapeFaceIds.reduce((sum, faceId) => sum + clampShapeTaperPercent(sourceFaces[faceId]), 0);
+
+  return total / shapeFaceIds.length;
+}
+
+function hasTileShape(shape) {
+  const normalizedShape = normalizeTileShape(shape);
+
+  return normalizedShape.sides !== 4
+    || shapeFaceIds.some((faceId) => normalizedShape.faces[faceId] > 0.001);
+}
+
 function createDefaultLightObject() {
   return {
     id: 'scene-light',
@@ -441,14 +676,38 @@ function createDefaultLightObject() {
 function normalizeSceneObject(object, tileSizePixels) {
   const commonObject = {
     ...object,
+    name: String(object.name || 'Objeto'),
     visible: object.visible !== false,
     locked: object.locked === true,
     moveSnap: object.moveSnap !== false,
     rotateSnap: object.rotateSnap !== false
   };
 
+  if (object.type === 'sphere' || object.type === 'model') {
+    const fallbackPosition = [0.5, 0.5, 0.5];
+
+    return {
+      ...commonObject,
+      transform: {
+        position: object.transform?.position || fallbackPosition,
+        rotation: object.transform?.rotation || [0, 0, 0],
+        scale: object.transform?.scale || [1, 1, 1]
+      },
+      material: clonePaintableMaterial(object.material),
+      texturePaint: normalizeTexturePaint(object.texturePaint, getDefaultTextureLayoutType(object)),
+      sourceModel: object.type === 'model' ? normalizeSourceModel(object.sourceModel) : undefined
+    };
+  }
+
   if (object.type !== 'tile') {
-    return commonObject;
+    return {
+      ...commonObject,
+      transform: {
+        position: object.transform?.position || [0, 0, 0],
+        rotation: object.transform?.rotation || [0, 0, 0],
+        scale: object.transform?.scale || [1, 1, 1]
+      }
+    };
   }
 
   const existingPosition = object.transform?.position;
@@ -478,6 +737,8 @@ function normalizeSceneObject(object, tileSizePixels) {
     },
     material: normalizeTileMaterial(object.material),
     rounding: normalizeTileRounding(object.rounding),
+    shape: normalizeTileShape(object.shape),
+    texturePaint: normalizeTexturePaint(object.texturePaint, getDefaultTextureLayoutType(object)),
     resizeSnap: object.resizeSnap !== false,
     moveSnap: object.moveSnap !== false,
     rotateSnap: object.rotateSnap !== false
@@ -509,9 +770,17 @@ function normalizeTilesets(tilesets) {
 
 function normalizeProject(project) {
   const tileSizePixels = normalizeTileSizePixels(project.grid?.tileSizePixels);
-  const objects = Array.isArray(project.scene?.objects)
+  const sourceObjects = Array.isArray(project.scene?.objects)
     ? project.scene.objects
     : [createDefaultLightObject()];
+  const objects = sourceObjects
+    .map((object) => normalizeSceneObject(object, tileSizePixels))
+    .filter((object) => isSupportedSceneObjectType(object.type));
+
+  if (!objects.some((object) => object.id === 'scene-light')) {
+    objects.unshift(createDefaultLightObject());
+  }
+
   const objectIds = new Set(objects.map((object) => object.id));
   const groups = Array.isArray(project.scene?.groups)
     ? project.scene.groups.map((group, index) => ({
@@ -541,7 +810,7 @@ function normalizeProject(project) {
     tilesets: normalizeTilesets(project.tilesets),
     scene: {
       units: project.scene?.units || 'meters',
-      objects: objects.map((object) => normalizeSceneObject(object, tileSizePixels)),
+      objects,
       groups,
       camera: project.scene?.camera || {
         position: [6, 5, 8],
@@ -945,14 +1214,57 @@ function createIconElement(iconId) {
   return icon;
 }
 
+function getObjectIconId(object) {
+  if (object?.type === 'directional-light') {
+    return '#icon-light';
+  }
+
+  if (object?.type === 'sphere') {
+    return '#icon-model';
+  }
+
+  if (object?.type === 'model') {
+    return '#icon-cube';
+  }
+
+  return '#icon-tile';
+}
+
+function getPropertySectionKeyForViewportTool(tool = state.viewportTool) {
+  if (tool === 'rotate') {
+    return 'rotation';
+  }
+
+  if (tool === 'scale') {
+    return 'dimensions';
+  }
+
+  if (tool === 'round') {
+    return 'rounding';
+  }
+
+  if (tool === 'shape') {
+    return 'shape';
+  }
+
+  return 'basic';
+}
+
 function setSelectedObjects(objectIds, primaryObjectId = objectIds.at(-1) || null) {
   const validObjectIds = objectIds.filter((objectId) => getObjectById(objectId));
+  const previousSelectedObjectId = state.selectedObjectId;
+  const previousSelectedGroupId = state.selectedGroupId;
   state.selectedObjectIds = new Set(validObjectIds);
   state.selectedObjectId = validObjectIds.includes(primaryObjectId)
     ? primaryObjectId
     : validObjectIds.at(-1) || null;
   state.selectedGroupId = null;
   state.selectionAnchorObjectId = state.selectedObjectId;
+
+  if (previousSelectedObjectId !== state.selectedObjectId || previousSelectedGroupId) {
+    state.propertyAccordionOpenKey = getPropertySectionKeyForViewportTool();
+  }
+
   const selectedObject = getObjectById(state.selectedObjectId);
 
   if (selectedObject?.type === 'tile') {
@@ -1022,6 +1334,7 @@ function selectGroup(groupId) {
   state.selectedObjectIds = new Set();
   state.selectedObjectId = null;
   state.selectionAnchorObjectId = null;
+  state.propertyAccordionOpenKey = getPropertySectionKeyForViewportTool();
   applyViewportSelectionState();
   renderTransformHandles();
   renderTileStylePanel();
@@ -1126,10 +1439,52 @@ function createPropertyDivider() {
   return '<div class="property-divider" role="separator" aria-hidden="true"></div>';
 }
 
+function createPropertySection(section) {
+  const isOpen = section.key === state.propertyAccordionOpenKey;
+  const openAttribute = isOpen ? ' open' : '';
+  const content = Array.isArray(section.items) ? section.items.join('') : String(section.items || '');
+
+  return `
+    <details class="property-accordion"${openAttribute} data-property-section="${section.key}">
+      <summary class="property-accordion-summary" data-property-section-summary="${section.key}">
+        <span>${section.title}</span>
+      </summary>
+      <div class="property-accordion-content">${content}</div>
+    </details>
+  `;
+}
+
+function renderPropertySections(sections) {
+  const availableSections = sections.filter((section) => section?.key && section?.title);
+
+  if (availableSections.length === 0) {
+    elements.propertyFields.innerHTML = '';
+    return;
+  }
+
+  if (!availableSections.some((section) => section.key === state.propertyAccordionOpenKey)) {
+    state.propertyAccordionOpenKey = availableSections[0].key;
+  }
+
+  elements.propertyFields.innerHTML = availableSections.map(createPropertySection).join('');
+}
+
+function setPropertyAccordionOpen(key) {
+  const sections = [...elements.propertyFields.querySelectorAll('.property-accordion')];
+  const nextKey = sections.length > 0 && !sections.some((section) => section.dataset.propertySection === key)
+    ? sections[0].dataset.propertySection
+    : key;
+
+  state.propertyAccordionOpenKey = nextKey;
+
+  sections.forEach((section) => {
+    section.open = section.dataset.propertySection === nextKey;
+  });
+}
+
 function createRoundingProperties(tile, isDisabled = false) {
   const rounding = normalizeTileRounding(tile.rounding);
   const properties = [
-    '<div class="property-section-title">Arredondamento</div>',
     createNumericProperty('Todas as bordas', 'rounding-all', getRoundingAveragePercent(rounding), {
       precision: 0,
       min: 0,
@@ -1154,6 +1509,42 @@ function createRoundingProperties(tile, isDisabled = false) {
           disabled: isDisabled
         }));
       });
+  });
+
+  return properties;
+}
+
+function createShapeProperties(tile, isDisabled = false) {
+  const shape = normalizeTileShape(tile.shape);
+
+  const properties = [
+    createNumericProperty('Todas as faces', 'shape-all', getShapeFacesAveragePercent(shape), {
+      precision: 0,
+      min: 0,
+      max: 100,
+      step: 1,
+      unit: '%',
+      disabled: isDisabled
+    }),
+    createNumericProperty('Lados da base', 'shape-sides', shape.sides, {
+      precision: 0,
+      min: shapeSidesMin,
+      max: shapeSidesMax,
+      step: 1,
+      disabled: isDisabled
+    })
+  ];
+
+  properties.push('<div class="property-subsection-title">Faces</div>');
+  shapeFaceDefinitions.forEach((face) => {
+    properties.push(createNumericProperty(face.label, `shape-face-${face.id}`, getShapeFaceValue(shape, face.id), {
+      precision: 0,
+      min: 0,
+      max: 100,
+      step: 1,
+      unit: '%',
+      disabled: isDisabled
+    }));
   });
 
   return properties;
@@ -1216,6 +1607,7 @@ function renderPropertiesPanel() {
 
   if (selectedGroup) {
     renderGroupPropertiesPanel(selectedGroup);
+    renderTexturePanel();
     return;
   }
 
@@ -1224,6 +1616,7 @@ function renderPropertiesPanel() {
   if (!selectedObject) {
     elements.selectedObjectName.textContent = 'Nenhum';
     elements.propertyFields.innerHTML = '<div class="property-empty">Nenhum objeto selecionado.</div>';
+    renderTexturePanel();
     return;
   }
 
@@ -1237,7 +1630,7 @@ function renderPropertiesPanel() {
   const gridPosition = selectedObject.gridPosition || [0, 0];
   const tilePositionPixels = selectedObject.type === 'tile' ? getTilePositionPixels(selectedObject) : [0, 0, 0];
 
-  const properties = [
+  const basicProperties = [
     createNumericProperty('Localização X', 'position-x', selectedObject.type === 'tile' ? tilePositionPixels[0] : position[0], {
       precision: selectedObject.type === 'tile' ? 0 : 3,
       step: selectedObject.type === 'tile' ? 1 : 0.01,
@@ -1253,34 +1646,56 @@ function renderPropertiesPanel() {
       step: selectedObject.type === 'tile' ? 1 : 0.01,
       unit: selectedObject.type === 'tile' ? 'px' : 'm'
     }),
-    `<label class="property-toggle">Movimento magnético <input type="checkbox" data-object-move-snap ${selectedObject.moveSnap !== false ? 'checked' : ''}></label>`,
-    createPropertyDivider(),
+    `<label class="property-toggle">Movimento magnético <input type="checkbox" data-object-move-snap ${selectedObject.moveSnap !== false ? 'checked' : ''}></label>`
+  ];
+  const rotationProperties = [
     createNumericProperty('Rotação X', 'rotation-x', Number(rotation[0] || 0), { step: 0.1, unit: 'deg' }),
     createNumericProperty('Rotação Y', 'rotation-y', Number(rotation[1] || 0), { step: 0.1, unit: 'deg' }),
     createNumericProperty('Rotação Z', 'rotation-z', Number(rotation[2] || 0), { step: 0.1, unit: 'deg' }),
-    `<label class="property-toggle">Rotação magnética <input type="checkbox" data-object-rotate-snap ${selectedObject.rotateSnap !== false ? 'checked' : ''}></label>`,
-    createPropertyDivider()
+    `<label class="property-toggle">Rotação magnética <input type="checkbox" data-object-rotate-snap ${selectedObject.rotateSnap !== false ? 'checked' : ''}></label>`
+  ];
+  const sections = [
+    { key: 'basic', title: 'Básico', items: basicProperties },
+    { key: 'rotation', title: 'Rotação', items: rotationProperties }
   ];
 
   if (selectedObject.type === 'tile') {
-    properties.push(
-      createNumericProperty('Largura', 'width', selectedObject.size?.widthPixels || tileSizePixels, { precision: 0, min: tileSizePixels, step: 1, unit: 'px' }),
-      createNumericProperty('Profundidade', 'depth', selectedObject.size?.depthPixels || tileSizePixels, { precision: 0, min: tileSizePixels, step: 1, unit: 'px' }),
-      createNumericProperty('Altura', 'height', selectedObject.size?.heightPixels || 1, { precision: 0, min: 1, step: 1, unit: 'px' }),
-      createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01 }),
-      `<label class="property-toggle">Transformação magnética <input type="checkbox" data-tile-resize-snap ${selectedObject.resizeSnap !== false ? 'checked' : ''}></label>`,
-      createPropertyDivider(),
-      ...createRoundingProperties(selectedObject, isLocked),
-      createPropertyDivider(),
-      `<div class="property-note"><span>Célula</span><span>${gridPosition[0]}, ${gridPosition[1]}</span></div>`,
-      `<div class="property-note"><span>Quadrado</span><span>${tileSizePixels} x ${tileSizePixels} px</span></div>`
+    sections.push(
+      {
+        key: 'dimensions',
+        title: 'Dimensões',
+        items: [
+          createNumericProperty('Largura', 'width', selectedObject.size?.widthPixels || tileSizePixels, { precision: 0, min: tileSizePixels, step: 1, unit: 'px' }),
+          createNumericProperty('Profundidade', 'depth', selectedObject.size?.depthPixels || tileSizePixels, { precision: 0, min: tileSizePixels, step: 1, unit: 'px' }),
+          createNumericProperty('Altura', 'height', selectedObject.size?.heightPixels || 1, { precision: 0, min: 1, step: 1, unit: 'px' }),
+          createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01 }),
+          `<label class="property-toggle">Transformação magnética <input type="checkbox" data-tile-resize-snap ${selectedObject.resizeSnap !== false ? 'checked' : ''}></label>`
+        ]
+      },
+      { key: 'shape', title: 'Forma', items: createShapeProperties(selectedObject, isLocked) },
+      { key: 'rounding', title: 'Arredondamento', items: createRoundingProperties(selectedObject, isLocked) },
+      {
+        key: 'info',
+        title: 'Info',
+        items: [
+          `<div class="property-note"><span>Célula</span><span>${gridPosition[0]}, ${gridPosition[1]}</span></div>`,
+          `<div class="property-note"><span>Quadrado</span><span>${tileSizePixels} x ${tileSizePixels} px</span></div>`
+        ]
+      }
     );
   } else {
-    properties.push(createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01 }));
+    sections.push({
+      key: 'dimensions',
+      title: 'Dimensões',
+      items: [createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01 })]
+    });
   }
 
   if (selectedObject.type === 'directional-light') {
-    properties.push(createPropertyDivider(), `
+    sections.push({
+      key: 'light',
+      title: 'Luz',
+      items: [`
       <div class="light-controls" aria-label="Mover luz">
         <button type="button" data-light-action="orbit-left">Órbita -</button>
         <button type="button" data-light-action="orbit-right">Órbita +</button>
@@ -1289,14 +1704,17 @@ function renderPropertiesPanel() {
         <button type="button" data-light-action="distance-in">Distância -</button>
         <button type="button" data-light-action="distance-out">Distância +</button>
       </div>
-    `);
+    `]
+    });
   }
 
-  elements.propertyFields.innerHTML = properties.join('');
+  renderPropertySections(sections);
 
   if (isLocked) {
     setPropertiesDisabled('Objeto bloqueado. Desbloqueie o cadeado para editar propriedades e transformações.');
   }
+
+  renderTexturePanel();
 }
 
 function setPropertiesDisabled(message) {
@@ -1325,31 +1743,1369 @@ function renderGroupPropertiesPanel(group) {
     return;
   }
 
-  const properties = [
-    createNumericProperty('Localização X', 'position-x', groupMetrics.originPixels[0], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
-    createNumericProperty('Localização Y', 'position-y', groupMetrics.originPixels[1], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
-    createNumericProperty('Localização Z', 'position-z', groupMetrics.originPixels[2], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
-    createToggleProperty('Movimento magnético', 'data-object-move-snap', group.moveSnap !== false, isLocked),
-    createPropertyDivider(),
-    createNumericProperty('Rotação X', 'rotation-x', Number(rotation[0] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
-    createNumericProperty('Rotação Y', 'rotation-y', Number(rotation[1] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
-    createNumericProperty('Rotação Z', 'rotation-z', Number(rotation[2] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
-    createToggleProperty('Rotação magnética', 'data-object-rotate-snap', group.rotateSnap !== false, isLocked),
-    createPropertyDivider(),
-    createNumericProperty('Largura', 'width', groupMetrics.widthPixels, { precision: 0, min: groupMetrics.tileSizePixels, step: 1, unit: 'px', disabled: isLocked }),
-    createNumericProperty('Profundidade', 'depth', groupMetrics.depthPixels, { precision: 0, min: groupMetrics.tileSizePixels, step: 1, unit: 'px', disabled: isLocked }),
-    createNumericProperty('Altura', 'height', groupMetrics.heightPixels, { precision: 0, min: 1, step: 1, unit: 'px', disabled: isLocked }),
-    createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01, disabled: isLocked }),
-    createToggleProperty('Transformação magnética', 'data-tile-resize-snap', group.resizeSnap !== false, isLocked),
-    createPropertyDivider(),
-    `<div class="property-note"><span>Itens</span><span>${groupObjects.length}</span></div>`,
-    `<div class="property-note"><span>Quadrado</span><span>${groupMetrics.tileSizePixels} x ${groupMetrics.tileSizePixels} px</span></div>`
+  const sections = [
+    {
+      key: 'basic',
+      title: 'Básico',
+      items: [
+        createNumericProperty('Localização X', 'position-x', groupMetrics.originPixels[0], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
+        createNumericProperty('Localização Y', 'position-y', groupMetrics.originPixels[1], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
+        createNumericProperty('Localização Z', 'position-z', groupMetrics.originPixels[2], { precision: 0, step: 1, unit: 'px', disabled: isLocked }),
+        createToggleProperty('Movimento magnético', 'data-object-move-snap', group.moveSnap !== false, isLocked)
+      ]
+    },
+    {
+      key: 'rotation',
+      title: 'Rotação',
+      items: [
+        createNumericProperty('Rotação X', 'rotation-x', Number(rotation[0] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
+        createNumericProperty('Rotação Y', 'rotation-y', Number(rotation[1] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
+        createNumericProperty('Rotação Z', 'rotation-z', Number(rotation[2] || 0), { step: 0.1, unit: 'deg', disabled: isLocked }),
+        createToggleProperty('Rotação magnética', 'data-object-rotate-snap', group.rotateSnap !== false, isLocked)
+      ]
+    },
+    {
+      key: 'dimensions',
+      title: 'Dimensões',
+      items: [
+        createNumericProperty('Largura', 'width', groupMetrics.widthPixels, { precision: 0, min: groupMetrics.tileSizePixels, step: 1, unit: 'px', disabled: isLocked }),
+        createNumericProperty('Profundidade', 'depth', groupMetrics.depthPixels, { precision: 0, min: groupMetrics.tileSizePixels, step: 1, unit: 'px', disabled: isLocked }),
+        createNumericProperty('Altura', 'height', groupMetrics.heightPixels, { precision: 0, min: 1, step: 1, unit: 'px', disabled: isLocked }),
+        createNumericProperty('Escala', 'scale', Number(scale[0] || 1), { min: 0.01, step: 0.01, disabled: isLocked }),
+        createToggleProperty('Transformação magnética', 'data-tile-resize-snap', group.resizeSnap !== false, isLocked)
+      ]
+    },
+    {
+      key: 'info',
+      title: 'Info',
+      items: [
+        `<div class="property-note"><span>Itens</span><span>${groupObjects.length}</span></div>`,
+        `<div class="property-note"><span>Quadrado</span><span>${groupMetrics.tileSizePixels} x ${groupMetrics.tileSizePixels} px</span></div>`
+      ]
+    }
   ];
 
-  elements.propertyFields.innerHTML = properties.join('');
+  renderPropertySections(sections);
 
   if (isLocked) {
     setPropertiesDisabled('Grupo bloqueado. Desbloqueie o cadeado para editar o grupo.');
+  }
+}
+
+function getSelectedTextureObject() {
+  if (state.selectedGroupId) {
+    return null;
+  }
+
+  const selectedObject = getSelectedObject();
+  return isPaintableObjectType(selectedObject?.type) ? selectedObject : null;
+}
+
+function getTexturePanel() {
+  return elements.textureCanvas?.closest('.texture-panel') || null;
+}
+
+function setTexturePanelMessage(message, options = {}) {
+  const panel = getTexturePanel();
+
+  if (elements.textureObjectName) {
+    elements.textureObjectName.textContent = options.objectName || 'Nenhum';
+  }
+
+  if (elements.textureEmptyMessage) {
+    elements.textureEmptyMessage.textContent = message;
+  }
+
+  panel?.classList.toggle('texture-ready', options.ready === true);
+  panel?.classList.toggle('texture-warning', options.warning === true);
+}
+
+function ensureObjectTexturePaint(object) {
+  if (!object || !isPaintableObjectType(object.type)) {
+    return null;
+  }
+
+  object.texturePaint = normalizeTexturePaint(object.texturePaint, getDefaultTextureLayoutType(object));
+  return object.texturePaint;
+}
+
+function createPaintCanvas(width, height) {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d');
+
+  canvas.width = width;
+  canvas.height = height;
+  context.fillStyle = defaultTileColor;
+  context.fillRect(0, 0, width, height);
+
+  return canvas;
+}
+
+function loadPaintImageIntoRecord(object, record, imageDataUrl) {
+  if (!imageDataUrl || record.loadingDataUrl === imageDataUrl) {
+    return;
+  }
+
+  record.loadingDataUrl = imageDataUrl;
+
+  const image = new Image();
+  image.addEventListener('load', () => {
+    if (record.loadingDataUrl !== imageDataUrl) {
+      return;
+    }
+
+    const context = record.canvas.getContext('2d');
+    context.fillStyle = defaultTileColor;
+    context.fillRect(0, 0, record.canvas.width, record.canvas.height);
+    context.drawImage(image, 0, 0, record.canvas.width, record.canvas.height);
+    record.imageDataUrl = imageDataUrl;
+    record.loadingDataUrl = null;
+    refreshPaintTexture(object.id);
+
+    if (getSelectedObject()?.id === object.id) {
+      renderTexturePanel();
+    }
+  }, { once: true });
+  image.addEventListener('error', () => {
+    record.loadingDataUrl = null;
+  }, { once: true });
+  image.src = imageDataUrl;
+}
+
+function ensurePaintCanvasRecord(object) {
+  const texturePaint = ensureObjectTexturePaint(object);
+
+  if (!texturePaint) {
+    return null;
+  }
+
+  let record = viewport.paintCanvasCache.get(object.id);
+
+  if (!record || record.canvas.width !== texturePaint.width || record.canvas.height !== texturePaint.height) {
+    record = {
+      canvas: createPaintCanvas(texturePaint.width, texturePaint.height),
+      imageDataUrl: '',
+      loadingDataUrl: null
+    };
+    viewport.paintCanvasCache.set(object.id, record);
+  }
+
+  if (record.imageDataUrl !== texturePaint.imageDataUrl) {
+    const context = record.canvas.getContext('2d');
+    context.fillStyle = defaultTileColor;
+    context.fillRect(0, 0, record.canvas.width, record.canvas.height);
+    record.imageDataUrl = texturePaint.imageDataUrl || '';
+
+    if (texturePaint.imageDataUrl) {
+      loadPaintImageIntoRecord(object, record, texturePaint.imageDataUrl);
+    }
+  }
+
+  return record;
+}
+
+function persistPaintCanvas(object, record) {
+  const texturePaint = ensureObjectTexturePaint(object);
+
+  if (!texturePaint || !record) {
+    return;
+  }
+
+  texturePaint.imageDataUrl = record.canvas.toDataURL('image/png');
+  record.imageDataUrl = texturePaint.imageDataUrl;
+}
+
+function getBoxTextureRegions(width, height) {
+  const gap = Math.max(6, Math.round(width * 0.016));
+  const faceSize = Math.floor((width - (gap * 3) - 72) / 4);
+  const startX = Math.floor((width - ((faceSize * 4) + (gap * 3))) / 2);
+  const startY = Math.floor((height - ((faceSize * 3) + (gap * 2))) / 2);
+  const rowMiddle = startY + faceSize + gap;
+
+  return [
+    { id: 'y_pos', x: startX + faceSize + gap, y: startY, width: faceSize, height: faceSize },
+    { id: 'x_neg', x: startX, y: rowMiddle, width: faceSize, height: faceSize },
+    { id: 'z_pos', x: startX + faceSize + gap, y: rowMiddle, width: faceSize, height: faceSize },
+    { id: 'x_pos', x: startX + ((faceSize + gap) * 2), y: rowMiddle, width: faceSize, height: faceSize },
+    { id: 'z_neg', x: startX + ((faceSize + gap) * 3), y: rowMiddle, width: faceSize, height: faceSize },
+    { id: 'y_neg', x: startX + faceSize + gap, y: rowMiddle + faceSize + gap, width: faceSize, height: faceSize }
+  ];
+}
+
+function getBoxFaceVertexDefinitions() {
+  return {
+    y_pos: [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]],
+    y_neg: [[-1, -1, 1], [1, -1, 1], [1, -1, -1], [-1, -1, -1]],
+    x_neg: [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]],
+    z_pos: [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
+    x_pos: [[1, -1, 1], [1, -1, -1], [1, 1, -1], [1, 1, 1]],
+    z_neg: [[1, -1, -1], [-1, -1, -1], [-1, 1, -1], [1, 1, -1]]
+  };
+}
+
+function getPolygonBounds(points) {
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(0, maxX - minX),
+    height: Math.max(0, maxY - minY)
+  };
+}
+
+function getPolygonArea(points) {
+  if (!Array.isArray(points) || points.length < 3) {
+    return 0;
+  }
+
+  let area = 0;
+
+  for (let index = 0; index < points.length; index += 1) {
+    const current = points[index];
+    const next = points[(index + 1) % points.length];
+    area += (current.x * next.y) - (next.x * current.y);
+  }
+
+  return Math.abs(area) / 2;
+}
+
+function isPointInPolygon(point, polygon) {
+  if (!point || !Array.isArray(polygon) || polygon.length < 3) {
+    return false;
+  }
+
+  let inside = false;
+
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const first = polygon[index];
+    const second = polygon[previous];
+    const intersects = ((first.y > point.y) !== (second.y > point.y))
+      && point.x < (((second.x - first.x) * (point.y - first.y)) / ((second.y - first.y) || 0.000001)) + first.x;
+
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+
+  return inside;
+}
+
+function applyCanvasPolygonPath(context, polygon) {
+  if (!Array.isArray(polygon) || polygon.length < 3) {
+    return false;
+  }
+
+  context.beginPath();
+  polygon.forEach((point, index) => {
+    if (index === 0) {
+      context.moveTo(point.x, point.y);
+    } else {
+      context.lineTo(point.x, point.y);
+    }
+  });
+  context.closePath();
+  return true;
+}
+
+function getTriangleBarycentricPoint(point, first, second, third) {
+  const v0x = second.x - first.x;
+  const v0y = second.y - first.y;
+  const v1x = third.x - first.x;
+  const v1y = third.y - first.y;
+  const v2x = point.x - first.x;
+  const v2y = point.y - first.y;
+  const denominator = (v0x * v1y) - (v1x * v0y);
+
+  if (Math.abs(denominator) < 0.000001) {
+    return null;
+  }
+
+  const u = ((v2x * v1y) - (v1x * v2y)) / denominator;
+  const v = ((v0x * v2y) - (v2x * v0y)) / denominator;
+  const w = 1 - u - v;
+  const tolerance = -0.0001;
+
+  if (u < tolerance || v < tolerance || w < tolerance) {
+    return null;
+  }
+
+  return { first: w, second: u, third: v };
+}
+
+function interpolateTrianglePoint(barycentric, first, second, third) {
+  return {
+    x: (first.x * barycentric.first) + (second.x * barycentric.second) + (third.x * barycentric.third),
+    y: (first.y * barycentric.first) + (second.y * barycentric.second) + (third.y * barycentric.third)
+  };
+}
+
+function mapPointBetweenQuadPolygons(point, sourcePolygon, targetPolygon) {
+  const triangleIndexes = [[0, 1, 2], [0, 2, 3]];
+
+  for (const indexes of triangleIndexes) {
+    const barycentric = getTriangleBarycentricPoint(
+      point,
+      sourcePolygon[indexes[0]],
+      sourcePolygon[indexes[1]],
+      sourcePolygon[indexes[2]]
+    );
+
+    if (barycentric) {
+      return interpolateTrianglePoint(
+        barycentric,
+        targetPolygon[indexes[0]],
+        targetPolygon[indexes[1]],
+        targetPolygon[indexes[2]]
+      );
+    }
+  }
+
+  return null;
+}
+
+function getBoxFaceDisplayLocalPoint(faceId, vertex) {
+  if (faceId === 'y_pos' || faceId === 'y_neg') {
+    return { x: vertex.x, y: -vertex.z };
+  }
+
+  if (faceId === 'x_pos' || faceId === 'x_neg') {
+    return { x: vertex.z, y: -vertex.y };
+  }
+
+  return { x: vertex.x, y: -vertex.y };
+}
+
+function getBoxFaceSourcePoint(faceId, vertex, sourceRegion, metrics) {
+  const safeWidth = Math.max(metrics.widthUnits, 0.0001);
+  const safeHeight = Math.max(metrics.heightUnits, 0.0001);
+  const safeDepth = Math.max(metrics.depthUnits, 0.0001);
+  let localU = (vertex.x / safeWidth) + 0.5;
+  let localV = (vertex.y / safeHeight) + 0.5;
+
+  if (faceId === 'y_pos' || faceId === 'y_neg') {
+    localU = (vertex.x / safeWidth) + 0.5;
+    localV = (vertex.z / safeDepth) + 0.5;
+  } else if (faceId === 'x_pos' || faceId === 'x_neg') {
+    localU = (vertex.z / safeDepth) + 0.5;
+    localV = (vertex.y / safeHeight) + 0.5;
+  }
+
+  return {
+    x: sourceRegion.x + (Math.min(1, Math.max(0, localU)) * sourceRegion.width),
+    y: sourceRegion.y + ((1 - Math.min(1, Math.max(0, localV))) * sourceRegion.height)
+  };
+}
+
+function getTileBoxFaceRawRegions(object, sourceRegions) {
+  if (object?.type !== 'tile' || normalizeTileShape(object.shape).sides !== 4) {
+    return null;
+  }
+
+  const metrics = getTileRenderMetrics(object);
+  const definitions = getBoxFaceVertexDefinitions();
+  const sourceById = new Map(sourceRegions.map((region) => [region.id, region]));
+
+  return Object.entries(definitions).map(([faceId, signs]) => {
+    const sourceRegion = sourceById.get(faceId);
+    const baseVertices = signs.map(([xSign, ySign, zSign]) => (
+      new THREE.Vector3(
+        xSign * (metrics.widthUnits / 2),
+        ySign * (metrics.heightUnits / 2),
+        zSign * (metrics.depthUnits / 2)
+      )
+    ));
+    const displayVertices = baseVertices.map((baseVertex) => {
+      const vertex = baseVertex.clone();
+      deformTaperedBoxPosition(vertex, metrics.widthUnits, metrics.heightUnits, metrics.depthUnits, object.shape);
+      return vertex;
+    });
+    const localPolygon = displayVertices.map((vertex) => getBoxFaceDisplayLocalPoint(faceId, vertex));
+    const sourcePolygon = baseVertices.map((vertex) => getBoxFaceSourcePoint(faceId, vertex, sourceRegion, metrics));
+
+    return {
+      id: faceId,
+      sourceRegion,
+      localPolygon,
+      localBounds: getPolygonBounds(localPolygon),
+      sourcePolygon
+    };
+  }).filter((region) => region.sourceRegion);
+}
+
+function getFallbackTextureDisplayRegions(object, metrics) {
+  return getTextureRegions(object, metrics.sourceWidth, metrics.sourceHeight).map((sourceRegion) => ({
+    id: sourceRegion.id,
+    sourceRegion,
+    x: sourceRegion.x,
+    y: sourceRegion.y,
+    width: sourceRegion.width,
+    height: sourceRegion.height,
+    bounds: {
+      x: sourceRegion.x,
+      y: sourceRegion.y,
+      width: sourceRegion.width,
+      height: sourceRegion.height
+    },
+    displayPolygon: [
+      { x: sourceRegion.x, y: sourceRegion.y },
+      { x: sourceRegion.x + sourceRegion.width, y: sourceRegion.y },
+      { x: sourceRegion.x + sourceRegion.width, y: sourceRegion.y + sourceRegion.height },
+      { x: sourceRegion.x, y: sourceRegion.y + sourceRegion.height }
+    ],
+    sourcePolygon: [
+      { x: sourceRegion.x, y: sourceRegion.y },
+      { x: sourceRegion.x + sourceRegion.width, y: sourceRegion.y },
+      { x: sourceRegion.x + sourceRegion.width, y: sourceRegion.y + sourceRegion.height },
+      { x: sourceRegion.x, y: sourceRegion.y + sourceRegion.height }
+    ]
+  }));
+}
+
+function createBoxDisplayRegion(rawRegion, x, y, scale) {
+  const polygon = rawRegion.localPolygon.map((point) => ({
+    x: x + ((point.x - rawRegion.localBounds.x) * scale),
+    y: y + ((point.y - rawRegion.localBounds.y) * scale)
+  }));
+  const bounds = getPolygonBounds(polygon);
+
+  return {
+    id: rawRegion.id,
+    sourceRegion: rawRegion.sourceRegion,
+    sourcePolygon: rawRegion.sourcePolygon,
+    displayPolygon: polygon,
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    bounds
+  };
+}
+
+function layoutTileBoxDisplayRegions(rawRegions, metrics, scaleMultiplier = 1) {
+  const byId = new Map(rawRegions.map((region) => [region.id, region]));
+  const requiredIds = ['x_neg', 'z_pos', 'x_pos', 'z_neg', 'y_pos', 'y_neg'];
+
+  if (!requiredIds.every((id) => byId.has(id))) {
+    return null;
+  }
+
+  const margin = 14;
+  const gap = 12;
+  const sideIds = ['x_neg', 'z_pos', 'x_pos', 'z_neg'];
+  const sideWidth = sideIds.reduce((sum, id) => sum + byId.get(id).localBounds.width, 0);
+  const sideHeight = Math.max(...sideIds.map((id) => byId.get(id).localBounds.height));
+  const topHeight = byId.get('y_pos').localBounds.height;
+  const bottomHeight = byId.get('y_neg').localBounds.height;
+  const availableWidth = Math.max(32, metrics.displayWidth - (margin * 2) - (gap * 3));
+  const availableHeight = Math.max(32, metrics.displayHeight - (margin * 2) - (gap * 2));
+  let scale = Math.min(
+    availableWidth / Math.max(sideWidth, 0.0001),
+    availableHeight / Math.max(topHeight + sideHeight + bottomHeight, 0.0001)
+  ) * scaleMultiplier;
+
+  if (!Number.isFinite(scale) || scale <= 0) {
+    scale = 1;
+  }
+
+  const scaledSideWidth = sideWidth * scale + (gap * 3);
+  const rowX = Math.max(margin, (metrics.displayWidth - scaledSideWidth) / 2);
+  const rowY = margin + (topHeight * scale) + gap;
+  const positions = {};
+  let cursorX = rowX;
+
+  sideIds.forEach((id) => {
+    const rawRegion = byId.get(id);
+    positions[id] = {
+      x: cursorX,
+      y: rowY + ((sideHeight - rawRegion.localBounds.height) * scale)
+    };
+    cursorX += (rawRegion.localBounds.width * scale) + gap;
+  });
+
+  const zPosition = positions.z_pos;
+  positions.y_pos = {
+    x: zPosition.x + (((byId.get('z_pos').localBounds.width - byId.get('y_pos').localBounds.width) * scale) / 2),
+    y: margin
+  };
+  positions.y_neg = {
+    x: zPosition.x + (((byId.get('z_pos').localBounds.width - byId.get('y_neg').localBounds.width) * scale) / 2),
+    y: rowY + (sideHeight * scale) + gap
+  };
+
+  return requiredIds.map((id) => createBoxDisplayRegion(byId.get(id), positions[id].x, positions[id].y, scale))
+    .filter((region) => region.width >= 3 && region.height >= 3 && getPolygonArea(region.displayPolygon) >= 5);
+}
+
+function getBoxTextureDisplayRegions(object, metrics) {
+  const sourceRegions = getBoxTextureRegions(metrics.sourceWidth, metrics.sourceHeight);
+  const rawRegions = getTileBoxFaceRawRegions(object, sourceRegions);
+
+  if (!rawRegions) {
+    return getFallbackTextureDisplayRegions(object, metrics);
+  }
+
+  let displayRegions = layoutTileBoxDisplayRegions(rawRegions, metrics);
+
+  if (!displayRegions || displayRegions.length === 0) {
+    return getFallbackTextureDisplayRegions(object, metrics);
+  }
+
+  const allPoints = displayRegions.flatMap((region) => region.displayPolygon);
+  const bounds = getPolygonBounds(allPoints);
+  const margin = 8;
+  const overflowScale = Math.min(
+    1,
+    (metrics.displayWidth - (margin * 2)) / Math.max(bounds.width, 1),
+    (metrics.displayHeight - (margin * 2)) / Math.max(bounds.height, 1)
+  );
+
+  if (overflowScale < 1) {
+    displayRegions = layoutTileBoxDisplayRegions(rawRegions, metrics, overflowScale);
+  }
+
+  return displayRegions || getFallbackTextureDisplayRegions(object, metrics);
+}
+
+function getTextureDisplayRegions(object, metrics) {
+  if (metrics.layoutType === 'box') {
+    return getBoxTextureDisplayRegions(object, metrics);
+  }
+
+  return getFallbackTextureDisplayRegions(object, metrics);
+}
+
+function getFullTextureRegions(width, height) {
+  return [{ id: 'uv', x: 0, y: 0, width, height }];
+}
+
+function getSphereTextureRegions(width, height) {
+  const columns = 12;
+  const rows = 6;
+  const regions = [];
+  const cellWidth = width / columns;
+  const cellHeight = height / rows;
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      regions.push({
+        id: `sphere-${column}-${row}`,
+        x: column * cellWidth,
+        y: row * cellHeight,
+        width: cellWidth,
+        height: cellHeight
+      });
+    }
+  }
+
+  return regions;
+}
+
+function getTextureRegions(object, width, height) {
+  const layoutType = ensureObjectTexturePaint(object)?.layoutType || getDefaultTextureLayoutType(object);
+
+  if (layoutType === 'sphere-equirect') {
+    return getSphereTextureRegions(width, height);
+  }
+
+  if (layoutType === 'uv') {
+    return getFullTextureRegions(width, height);
+  }
+
+  return getBoxTextureRegions(width, height);
+}
+
+function getTextureEditorMetrics(object, record) {
+  const sourceWidth = record?.canvas?.width || defaultPaintTextureSize;
+  const sourceHeight = record?.canvas?.height || defaultPaintTextureSize;
+  const layoutType = ensureObjectTexturePaint(object)?.layoutType || getDefaultTextureLayoutType(object);
+  const displayWidth = sourceWidth;
+  const displayHeight = layoutType === 'sphere-equirect'
+    ? Math.max(96, Math.round(sourceWidth / 2))
+    : sourceHeight;
+
+  return {
+    layoutType,
+    sourceWidth,
+    sourceHeight,
+    displayWidth,
+    displayHeight
+  };
+}
+
+function getSphereProjectionRect(metrics) {
+  const inset = 1;
+
+  return {
+    x: inset,
+    y: inset,
+    width: Math.max(1, metrics.displayWidth - (inset * 2)),
+    height: Math.max(1, metrics.displayHeight - (inset * 2))
+  };
+}
+
+function getSphereProjectionFactor(v) {
+  const latitude = (0.5 - Math.min(1, Math.max(0, v))) * Math.PI;
+  return Math.max(0, Math.cos(latitude));
+}
+
+function getSphereProjectionX(u, v, metrics) {
+  const rect = getSphereProjectionRect(metrics);
+  const factor = getSphereProjectionFactor(v);
+
+  return rect.x + (rect.width / 2) + ((Math.min(1, Math.max(0, u)) - 0.5) * rect.width * factor);
+}
+
+function getSphereProjectionY(v, metrics) {
+  const rect = getSphereProjectionRect(metrics);
+  return rect.y + (Math.min(1, Math.max(0, v)) * rect.height);
+}
+
+function getTextureSourcePointFromViewPoint(object, point, record) {
+  const metrics = getTextureEditorMetrics(object, record);
+
+  if (!point) {
+    return null;
+  }
+
+  if (metrics.layoutType === 'sphere-equirect') {
+    const rect = getSphereProjectionRect(metrics);
+    const v = (point.y - rect.y) / rect.height;
+
+    if (v < 0 || v > 1) {
+      return null;
+    }
+
+    const factor = getSphereProjectionFactor(v);
+    const halfWidth = (rect.width * factor) / 2;
+    const centerX = rect.x + (rect.width / 2);
+
+    if (halfWidth < 0.5) {
+      if (Math.abs(point.x - centerX) > 3) {
+        return null;
+      }
+
+      return {
+        x: metrics.sourceWidth / 2,
+        y: v * metrics.sourceHeight
+      };
+    }
+
+    const left = centerX - halfWidth;
+    const right = centerX + halfWidth;
+
+    if (point.x < left || point.x > right) {
+      return null;
+    }
+
+    const u = (point.x - left) / (right - left);
+
+    return {
+      x: u * metrics.sourceWidth,
+      y: v * metrics.sourceHeight
+    };
+  }
+
+  return {
+    x: (point.x / metrics.displayWidth) * metrics.sourceWidth,
+    y: (point.y / metrics.displayHeight) * metrics.sourceHeight
+  };
+}
+
+function getBoxTexturePaintTargetAtViewPoint(object, point, record, metrics) {
+  const displayRegions = getBoxTextureDisplayRegions(object, metrics);
+
+  for (const displayRegion of displayRegions) {
+    if (!isPointInPolygon(point, displayRegion.displayPolygon)) {
+      continue;
+    }
+
+    const sourcePoint = mapPointBetweenQuadPolygons(
+      point,
+      displayRegion.displayPolygon,
+      displayRegion.sourcePolygon
+    );
+
+    if (!sourcePoint) {
+      continue;
+    }
+
+    const sourcePointClamped = {
+      x: Math.min(record.canvas.width - 0.001, Math.max(0, sourcePoint.x)),
+      y: Math.min(record.canvas.height - 0.001, Math.max(0, sourcePoint.y))
+    };
+
+    return {
+      record,
+      sourcePoint: sourcePointClamped,
+      region: displayRegion.sourceRegion,
+      sourcePolygon: displayRegion.sourcePolygon,
+      displayRegion,
+      metrics
+    };
+  }
+
+  return null;
+}
+
+function getTextureRegionAtSourcePoint(object, point) {
+  const texturePaint = ensureObjectTexturePaint(object);
+
+  if (!texturePaint || !point) {
+    return null;
+  }
+
+  return getTextureRegions(object, texturePaint.width, texturePaint.height)
+    .find((region) => point.x >= region.x
+      && point.x <= region.x + region.width
+      && point.y >= region.y
+      && point.y <= region.y + region.height) || null;
+}
+
+function getTexturePaintTargetAtViewPoint(object, viewPoint) {
+  const record = ensurePaintCanvasRecord(object);
+
+  if (!record) {
+    return null;
+  }
+
+  const metrics = getTextureEditorMetrics(object, record);
+
+  if (metrics.layoutType === 'box') {
+    return getBoxTexturePaintTargetAtViewPoint(object, viewPoint, record, metrics);
+  }
+
+  const sourcePoint = getTextureSourcePointFromViewPoint(object, viewPoint, record);
+
+  if (!sourcePoint) {
+    return null;
+  }
+
+  const sourcePointClamped = {
+    x: Math.min(record.canvas.width - 0.001, Math.max(0, sourcePoint.x)),
+    y: Math.min(record.canvas.height - 0.001, Math.max(0, sourcePoint.y))
+  };
+  const region = getTextureRegionAtSourcePoint(object, sourcePointClamped);
+
+  if (!region) {
+    return null;
+  }
+
+  return {
+    record,
+    sourcePoint: sourcePointClamped,
+    region,
+    sourcePolygon: null,
+    metrics
+  };
+}
+
+function drawTextureGuideLine(context, x1, y1, x2, y2) {
+  context.beginPath();
+  context.moveTo(x1, y1);
+  context.lineTo(x2, y2);
+  context.stroke();
+}
+
+function drawSphereProjectionOutline(context, metrics) {
+  const samples = 96;
+
+  context.beginPath();
+
+  for (let index = 0; index <= samples; index += 1) {
+    const v = index / samples;
+    const x = getSphereProjectionX(1, v, metrics);
+    const y = getSphereProjectionY(v, metrics);
+
+    if (index === 0) {
+      context.moveTo(x, y);
+    } else {
+      context.lineTo(x, y);
+    }
+  }
+
+  for (let index = samples; index >= 0; index -= 1) {
+    const v = index / samples;
+    context.lineTo(getSphereProjectionX(0, v, metrics), getSphereProjectionY(v, metrics));
+  }
+
+  context.closePath();
+  context.stroke();
+}
+
+function drawSphereTextureGuides(context, metrics) {
+  const columns = 12;
+  const rows = 6;
+  const samples = 80;
+
+  context.save();
+  context.lineWidth = Math.max(1, metrics.displayWidth / 320);
+  context.strokeStyle = 'rgba(229, 225, 232, 0.88)';
+  context.setLineDash([]);
+  drawSphereProjectionOutline(context, metrics);
+  context.setLineDash([6, 4]);
+
+  for (let row = 1; row < rows; row += 1) {
+    const v = row / rows;
+    drawTextureGuideLine(
+      context,
+      getSphereProjectionX(0, v, metrics),
+      getSphereProjectionY(v, metrics),
+      getSphereProjectionX(1, v, metrics),
+      getSphereProjectionY(v, metrics)
+    );
+  }
+
+  for (let column = 1; column < columns; column += 1) {
+    const u = column / columns;
+    context.beginPath();
+
+    for (let index = 0; index <= samples; index += 1) {
+      const v = index / samples;
+      const x = getSphereProjectionX(u, v, metrics);
+      const y = getSphereProjectionY(v, metrics);
+
+      if (index === 0) {
+        context.moveTo(x, y);
+      } else {
+        context.lineTo(x, y);
+      }
+    }
+
+    context.stroke();
+  }
+
+  context.restore();
+}
+
+function drawTextureGuides(context, object, metrics) {
+  if (metrics.layoutType === 'sphere-equirect') {
+    drawSphereTextureGuides(context, metrics);
+    return;
+  }
+
+  const regions = getTextureDisplayRegions(object, metrics);
+
+  context.save();
+  context.lineWidth = Math.max(1, metrics.displayWidth / 256);
+  context.strokeStyle = 'rgba(229, 225, 232, 0.82)';
+  context.setLineDash([6, 4]);
+
+  if (object.type === 'model') {
+    const segments = getModelUvSegments(object);
+
+    if (segments.length > 0) {
+      segments.forEach((segment) => {
+        drawTextureGuideLine(
+          context,
+          segment[0] * metrics.displayWidth,
+          (1 - segment[1]) * metrics.displayHeight,
+          segment[2] * metrics.displayWidth,
+          (1 - segment[3]) * metrics.displayHeight
+        );
+      });
+      context.restore();
+      return;
+    }
+  }
+
+  regions.forEach((region) => {
+    if (region.displayPolygon && applyCanvasPolygonPath(context, region.displayPolygon)) {
+      context.stroke();
+      return;
+    }
+
+    context.strokeRect(region.x + 0.5, region.y + 0.5, region.width - 1, region.height - 1);
+  });
+  context.restore();
+}
+
+function getTriangleAffineTransform(sourceTriangle, targetTriangle) {
+  const [sourceA, sourceB, sourceC] = sourceTriangle;
+  const [targetA, targetB, targetC] = targetTriangle;
+  const denominator = (sourceA.x * (sourceB.y - sourceC.y))
+    + (sourceB.x * (sourceC.y - sourceA.y))
+    + (sourceC.x * (sourceA.y - sourceB.y));
+
+  if (Math.abs(denominator) < 0.000001) {
+    return null;
+  }
+
+  const a = ((targetA.x * (sourceB.y - sourceC.y))
+    + (targetB.x * (sourceC.y - sourceA.y))
+    + (targetC.x * (sourceA.y - sourceB.y))) / denominator;
+  const c = ((targetA.x * (sourceC.x - sourceB.x))
+    + (targetB.x * (sourceA.x - sourceC.x))
+    + (targetC.x * (sourceB.x - sourceA.x))) / denominator;
+  const e = ((targetA.x * ((sourceB.x * sourceC.y) - (sourceC.x * sourceB.y)))
+    + (targetB.x * ((sourceC.x * sourceA.y) - (sourceA.x * sourceC.y)))
+    + (targetC.x * ((sourceA.x * sourceB.y) - (sourceB.x * sourceA.y)))) / denominator;
+  const b = ((targetA.y * (sourceB.y - sourceC.y))
+    + (targetB.y * (sourceC.y - sourceA.y))
+    + (targetC.y * (sourceA.y - sourceB.y))) / denominator;
+  const d = ((targetA.y * (sourceC.x - sourceB.x))
+    + (targetB.y * (sourceA.x - sourceC.x))
+    + (targetC.y * (sourceB.x - sourceA.x))) / denominator;
+  const f = ((targetA.y * ((sourceB.x * sourceC.y) - (sourceC.x * sourceB.y)))
+    + (targetB.y * ((sourceC.x * sourceA.y) - (sourceA.x * sourceC.y)))
+    + (targetC.y * ((sourceA.x * sourceB.y) - (sourceB.x * sourceA.y)))) / denominator;
+
+  return { a, b, c, d, e, f };
+}
+
+function getExpandedTriangle(triangle, amount = 0.35) {
+  const center = triangle.reduce((sum, point) => ({
+    x: sum.x + point.x,
+    y: sum.y + point.y
+  }), { x: 0, y: 0 });
+  center.x /= triangle.length;
+  center.y /= triangle.length;
+
+  return triangle.map((point) => {
+    const dx = point.x - center.x;
+    const dy = point.y - center.y;
+    const length = Math.hypot(dx, dy);
+
+    if (length < 0.000001) {
+      return point;
+    }
+
+    return {
+      x: point.x + ((dx / length) * amount),
+      y: point.y + ((dy / length) * amount)
+    };
+  });
+}
+
+function applyTrianglePath(context, triangle) {
+  context.beginPath();
+  context.moveTo(triangle[0].x, triangle[0].y);
+  context.lineTo(triangle[1].x, triangle[1].y);
+  context.lineTo(triangle[2].x, triangle[2].y);
+  context.closePath();
+}
+
+function drawWarpedTextureTriangle(context, sourceCanvas, sourceTriangle, displayTriangle) {
+  const transform = getTriangleAffineTransform(sourceTriangle, displayTriangle);
+
+  if (!transform) {
+    return false;
+  }
+
+  context.save();
+  applyTrianglePath(context, getExpandedTriangle(displayTriangle));
+  context.clip();
+  context.setTransform(transform.a, transform.b, transform.c, transform.d, transform.e, transform.f);
+  context.drawImage(sourceCanvas, 0, 0);
+  context.restore();
+  return true;
+}
+
+function drawWarpedTextureQuad(context, sourceCanvas, sourcePolygon, displayPolygon) {
+  if (!Array.isArray(sourcePolygon)
+    || !Array.isArray(displayPolygon)
+    || sourcePolygon.length < 4
+    || displayPolygon.length < 4) {
+    return false;
+  }
+
+  const triangles = [[0, 1, 2], [0, 2, 3]];
+
+  return triangles
+    .map((indexes) => drawWarpedTextureTriangle(
+      context,
+      sourceCanvas,
+      indexes.map((index) => sourcePolygon[index]),
+      indexes.map((index) => displayPolygon[index])
+    ))
+    .every(Boolean);
+}
+
+function drawBoxTexturePreview(context, object, sourceCanvas, metrics) {
+  const regions = getBoxTextureDisplayRegions(object, metrics);
+
+  regions.forEach((region) => {
+    const sourceRegion = region.sourceRegion || region;
+
+    if (region.sourcePolygon
+      && region.displayPolygon
+      && drawWarpedTextureQuad(context, sourceCanvas, region.sourcePolygon, region.displayPolygon)) {
+      return;
+    }
+
+    context.save();
+
+    if (region.displayPolygon) {
+      applyCanvasPolygonPath(context, region.displayPolygon);
+      context.clip();
+    }
+
+    context.drawImage(
+      sourceCanvas,
+      sourceRegion.x,
+      sourceRegion.y,
+      sourceRegion.width,
+      sourceRegion.height,
+      region.bounds?.x ?? region.x,
+      region.bounds?.y ?? region.y,
+      region.bounds?.width ?? region.width,
+      region.bounds?.height ?? region.height
+    );
+    context.restore();
+  });
+}
+
+function drawSphereTexturePreview(context, sourceCanvas, metrics) {
+  const rect = getSphereProjectionRect(metrics);
+
+  context.save();
+  context.imageSmoothingEnabled = true;
+
+  for (let row = 0; row < Math.ceil(rect.height); row += 1) {
+    const v = (row + 0.5) / rect.height;
+    const factor = getSphereProjectionFactor(v);
+    const projectedWidth = Math.max(1, rect.width * factor);
+    const sourceY = Math.min(metrics.sourceHeight - 1, Math.floor(v * metrics.sourceHeight));
+    const targetX = rect.x + ((rect.width - projectedWidth) / 2);
+
+    context.drawImage(
+      sourceCanvas,
+      0,
+      sourceY,
+      metrics.sourceWidth,
+      1,
+      targetX,
+      rect.y + row,
+      projectedWidth,
+      1
+    );
+  }
+
+  context.restore();
+}
+
+function drawTextureCanvasImage(context, object, record, metrics) {
+  if (metrics.layoutType === 'sphere-equirect') {
+    drawSphereTexturePreview(context, record.canvas, metrics);
+    return;
+  }
+
+  if (metrics.layoutType === 'box') {
+    drawBoxTexturePreview(context, object, record.canvas, metrics);
+    return;
+  }
+
+  context.drawImage(record.canvas, 0, 0, metrics.displayWidth, metrics.displayHeight);
+}
+
+function renderTextureCanvasPreview(object, record) {
+  const canvas = elements.textureCanvas;
+  const context = canvas?.getContext('2d');
+
+  if (!canvas || !context || !record) {
+    return;
+  }
+
+  const metrics = getTextureEditorMetrics(object, record);
+
+  if (canvas.width !== metrics.displayWidth) {
+    canvas.width = metrics.displayWidth;
+  }
+
+  if (canvas.height !== metrics.displayHeight) {
+    canvas.height = metrics.displayHeight;
+  }
+
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  drawTextureCanvasImage(context, object, record, metrics);
+  drawTextureGuides(context, object, metrics);
+
+  const zoom = Math.min(textureZoomMax, Math.max(textureZoomMin, state.textureZoom));
+  elements.textureCanvasStage?.style.setProperty('--texture-stage-width', `${canvas.width * zoom}px`);
+  elements.textureCanvasStage?.style.setProperty('--texture-stage-height', `${canvas.height * zoom}px`);
+}
+
+function setTextureTool(tool) {
+  state.textureTool = ['bucket', 'brush', 'eraser'].includes(tool) ? tool : 'bucket';
+  renderTextureToolButtons();
+}
+
+function renderTextureToolButtons() {
+  const buttons = {
+    bucket: elements.textureBucketToolButton,
+    brush: elements.textureBrushToolButton,
+    eraser: elements.textureEraserToolButton
+  };
+
+  Object.entries(buttons).forEach(([tool, button]) => {
+    button?.classList.toggle('tool-active', state.textureTool === tool);
+    button?.setAttribute('aria-pressed', String(state.textureTool === tool));
+  });
+}
+
+function isSelectedModelUvReady(object) {
+  if (object?.type !== 'model') {
+    return true;
+  }
+
+  const cacheEntry = getModelCacheEntry(object);
+  return cacheEntry?.status === 'loaded' && cacheEntry.hasUv === true;
+}
+
+function renderTexturePanel() {
+  renderTextureToolButtons();
+
+  const object = getSelectedTextureObject();
+
+  if (!object) {
+    setTexturePanelMessage('Selecione um objeto pintável.');
+    return;
+  }
+
+  if (object.type === 'model' && !isSelectedModelUvReady(object)) {
+    const cacheEntry = getModelCacheEntry(object);
+    const message = cacheEntry?.status === 'loaded' && cacheEntry.hasUv === false
+      ? 'Modelo importado sem UV pintável.'
+      : 'Carregando UV do modelo importado.';
+    setTexturePanelMessage(message, {
+      objectName: object.name,
+      warning: cacheEntry?.hasUv === false
+    });
+    return;
+  }
+
+  const record = ensurePaintCanvasRecord(object);
+
+  if (!record) {
+    setTexturePanelMessage('Selecione um objeto pintável.');
+    return;
+  }
+
+  setTexturePanelMessage('', { ready: true, objectName: object.name });
+  renderTextureCanvasPreview(object, record);
+}
+
+function getTexturePointFromEvent(event) {
+  const canvas = elements.textureCanvas;
+  const rect = canvas.getBoundingClientRect();
+
+  return {
+    x: Math.min(canvas.width, Math.max(0, ((event.clientX - rect.left) / rect.width) * canvas.width)),
+    y: Math.min(canvas.height, Math.max(0, ((event.clientY - rect.top) / rect.height) * canvas.height))
+  };
+}
+
+function getActiveTexturePaintColor() {
+  return state.textureTool === 'eraser' ? defaultTileColor : normalizeHexColor(state.texturePaintColor);
+}
+
+function fillTextureRegion(object, point) {
+  const target = getTexturePaintTargetAtViewPoint(object, point);
+
+  if (!target) {
+    return false;
+  }
+
+  const context = target.record.canvas.getContext('2d');
+  context.fillStyle = getActiveTexturePaintColor();
+
+  if (target.sourcePolygon && applyCanvasPolygonPath(context, target.sourcePolygon)) {
+    context.fill();
+  } else {
+    context.fillRect(
+      Math.floor(target.region.x),
+      Math.floor(target.region.y),
+      Math.ceil(target.region.width),
+      Math.ceil(target.region.height)
+    );
+  }
+
+  return true;
+}
+
+function getSourceBrushSize(target) {
+  const brushSize = Math.max(2, Number(state.textureBrushSize) || 14);
+
+  if (!target?.metrics) {
+    return brushSize;
+  }
+
+  if (target.displayRegion?.bounds && target.sourcePolygon) {
+    const sourceBounds = getPolygonBounds(target.sourcePolygon);
+    const scaleX = sourceBounds.width / Math.max(target.displayRegion.bounds.width, 1);
+    const scaleY = sourceBounds.height / Math.max(target.displayRegion.bounds.height, 1);
+    return Math.max(1, brushSize * ((scaleX + scaleY) / 2));
+  }
+
+  const scaleX = target.metrics.sourceWidth / target.metrics.displayWidth;
+  const scaleY = target.metrics.sourceHeight / target.metrics.displayHeight;
+  return Math.max(1, brushSize * ((scaleX + scaleY) / 2));
+}
+
+function drawTextureBrushSegment(object, fromPoint, toPoint) {
+  const target = getTexturePaintTargetAtViewPoint(object, toPoint);
+  const previousTarget = getTexturePaintTargetAtViewPoint(object, fromPoint);
+
+  if (!target) {
+    return false;
+  }
+
+  const fromSourcePoint = previousTarget?.region?.id === target.region.id
+    ? previousTarget.sourcePoint
+    : target.sourcePoint;
+  const context = target.record.canvas.getContext('2d');
+  const brushSize = getSourceBrushSize(target);
+
+  context.save();
+  context.beginPath();
+  if (target.sourcePolygon) {
+    applyCanvasPolygonPath(context, target.sourcePolygon);
+  } else {
+    context.rect(target.region.x, target.region.y, target.region.width, target.region.height);
+  }
+  context.clip();
+  context.strokeStyle = getActiveTexturePaintColor();
+  context.fillStyle = getActiveTexturePaintColor();
+  context.lineWidth = brushSize;
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+  context.beginPath();
+  context.moveTo(fromSourcePoint.x, fromSourcePoint.y);
+  context.lineTo(target.sourcePoint.x, target.sourcePoint.y);
+  context.stroke();
+  context.beginPath();
+  context.arc(target.sourcePoint.x, target.sourcePoint.y, brushSize / 2, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+
+  return true;
+}
+
+function refreshPaintTexture(objectId) {
+  const texture = viewport.paintTextureCache.get(objectId);
+
+  if (texture) {
+    texture.needsUpdate = true;
+  }
+}
+
+function commitTexturePaint(object, record, options = {}) {
+  persistPaintCanvas(object, record);
+  refreshPaintTexture(object.id);
+  syncProjectSceneToViewport();
+  renderTextureCanvasPreview(object, record);
+
+  if (options.recordHistory) {
+    markEditorDirty();
+  }
+}
+
+function applyTexturePaintAtPoint(object, point, previousPoint = point) {
+  const record = ensurePaintCanvasRecord(object);
+  const didPaint = state.textureTool === 'bucket'
+    ? fillTextureRegion(object, point)
+    : drawTextureBrushSegment(object, previousPoint, point);
+
+  if (!didPaint || !record) {
+    return false;
+  }
+
+  commitTexturePaint(object, record);
+  return true;
+}
+
+function beginTextureCanvasPaint(event) {
+  const object = getSelectedTextureObject();
+
+  if (!object || isObjectEffectivelyLocked(object) || !isSelectedModelUvReady(object)) {
+    return;
+  }
+
+  event.preventDefault();
+  const point = getTexturePointFromEvent(event);
+  const target = getTexturePaintTargetAtViewPoint(object, point);
+
+  if (!target) {
+    return;
+  }
+
+  textureInteraction.isPainting = true;
+  textureInteraction.objectId = object.id;
+  textureInteraction.lastPoint = point;
+  textureInteraction.activeRegion = target.region.id;
+  elements.textureCanvas.setPointerCapture(event.pointerId);
+  applyTexturePaintAtPoint(object, point, point);
+
+  if (state.textureTool === 'bucket') {
+    endTextureCanvasPaint(event, { recordHistory: true });
+  }
+}
+
+function updateTextureCanvasPaint(event) {
+  if (!textureInteraction.isPainting || state.textureTool === 'bucket') {
+    return;
+  }
+
+  const object = getObjectById(textureInteraction.objectId);
+
+  if (!object || isObjectEffectivelyLocked(object)) {
+    return;
+  }
+
+  event.preventDefault();
+  const point = getTexturePointFromEvent(event);
+  applyTexturePaintAtPoint(object, point, textureInteraction.lastPoint || point);
+  textureInteraction.lastPoint = point;
+}
+
+function endTextureCanvasPaint(event, options = {}) {
+  if (!textureInteraction.isPainting) {
+    return;
+  }
+
+  const object = getObjectById(textureInteraction.objectId);
+  const record = object ? ensurePaintCanvasRecord(object) : null;
+
+  textureInteraction.isPainting = false;
+  textureInteraction.objectId = null;
+  textureInteraction.lastPoint = null;
+  textureInteraction.activeRegion = null;
+
+  if (elements.textureCanvas?.hasPointerCapture(event.pointerId)) {
+    elements.textureCanvas.releasePointerCapture(event.pointerId);
+  }
+
+  if (object && record && options.recordHistory !== false) {
+    commitTexturePaint(object, record, { recordHistory: true });
+  }
+}
+
+function zoomTextureCanvas(factor, anchorEvent = null) {
+  const scrollElement = elements.textureCanvasScroll;
+  const previousZoom = Math.min(textureZoomMax, Math.max(textureZoomMin, state.textureZoom));
+  const nextZoom = Math.min(textureZoomMax, Math.max(textureZoomMin, previousZoom * factor));
+
+  if (Math.abs(nextZoom - previousZoom) < 0.001) {
+    return;
+  }
+
+  const scrollRect = scrollElement?.getBoundingClientRect();
+  const anchorViewportX = anchorEvent && scrollRect ? anchorEvent.clientX - scrollRect.left : (scrollElement?.clientWidth || 0) / 2;
+  const anchorViewportY = anchorEvent && scrollRect ? anchorEvent.clientY - scrollRect.top : (scrollElement?.clientHeight || 0) / 2;
+  const anchorCanvasX = scrollElement ? (scrollElement.scrollLeft + anchorViewportX) / previousZoom : 0;
+  const anchorCanvasY = scrollElement ? (scrollElement.scrollTop + anchorViewportY) / previousZoom : 0;
+
+  state.textureZoom = nextZoom;
+  renderTexturePanel();
+
+  if (scrollElement) {
+    scrollElement.scrollLeft = Math.max(0, (anchorCanvasX * nextZoom) - anchorViewportX);
+    scrollElement.scrollTop = Math.max(0, (anchorCanvasY * nextZoom) - anchorViewportY);
   }
 }
 
@@ -1409,6 +3165,8 @@ function updateSelectedNumericProperty(input, options = {}) {
   } else if (propertyKey.startsWith('rounding-edge-') && selectedObject.type === 'tile') {
     const edgeId = propertyKey.slice('rounding-edge-'.length);
     selectedObject.rounding = setRoundingEdgeValue(selectedObject.rounding, edgeId, numericValue);
+  } else if (propertyKey.startsWith('shape-') && selectedObject.type === 'tile') {
+    selectedObject.shape = setTileShapeValue(selectedObject.shape, propertyKey, numericValue);
   } else if (propertyKey === 'scale') {
     const scaleValue = Math.max(0.01, numericValue);
     selectedObject.transform = {
@@ -2020,7 +3778,7 @@ function renderObjectTree() {
     const button = document.createElement('button');
     button.type = 'button';
     button.setAttribute('data-object-id', object.id);
-    const icon = createIconElement(object.type === 'tile' ? '#icon-tile' : '#icon-light');
+    const icon = createIconElement(getObjectIconId(object));
     const label = document.createElement('span');
     label.className = 'object-label';
     label.textContent = object.name;
@@ -2664,10 +4422,10 @@ function createThumbnail(project, index) {
   const object = document.createElement('div');
   object.className = 'thumbnail-object';
 
-  const plane = document.createElement('div');
-  plane.className = 'thumbnail-plane';
+  const ground = document.createElement('div');
+  ground.className = 'thumbnail-ground';
 
-  thumbnail.append(grid, object, plane);
+  thumbnail.append(grid, object, ground);
 
   return thumbnail;
 }
@@ -3104,6 +4862,20 @@ function createMaterialTextureMap(tileMaterial) {
     return null;
   }
 
+  const textureCacheKey = [
+    getTileMaterialKey(normalizedMaterial),
+    getTilesetImageCacheKey(tileset),
+    bounds.sourceX,
+    bounds.sourceY,
+    bounds.width,
+    bounds.height
+  ].join(':');
+  const cachedTexture = viewport.textureCache.get(textureCacheKey);
+
+  if (cachedTexture) {
+    return cachedTexture;
+  }
+
   const image = getTilesetImageElement(tileset);
 
   if (!image) {
@@ -3134,6 +4906,41 @@ function createMaterialTextureMap(tileMaterial) {
   texture.minFilter = THREE.NearestFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.userData.engineFlatCachedTexture = true;
+  viewport.textureCache.set(textureCacheKey, texture);
+
+  return texture;
+}
+
+function hasObjectPaintTexture(sceneObject) {
+  return Boolean(isPaintableObjectType(sceneObject?.type) && sceneObject.texturePaint?.imageDataUrl);
+}
+
+function createPaintTextureMap(sceneObject) {
+  if (!hasObjectPaintTexture(sceneObject)) {
+    return null;
+  }
+
+  const record = ensurePaintCanvasRecord(sceneObject);
+
+  if (!record) {
+    return null;
+  }
+
+  const cachedTexture = viewport.paintTextureCache.get(sceneObject.id);
+
+  if (cachedTexture) {
+    return cachedTexture;
+  }
+
+  const texture = new THREE.CanvasTexture(record.canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.userData.engineFlatPaintTexture = true;
+  viewport.paintTextureCache.set(sceneObject.id, texture);
 
   return texture;
 }
@@ -3148,6 +4955,147 @@ function createTileRenderMaterial(tileMaterial) {
     metalness: 0,
     roughness: 0.86
   });
+}
+
+function createSceneObjectRenderMaterial(sceneObject) {
+  const paintMap = createPaintTextureMap(sceneObject);
+
+  if (paintMap) {
+    return new THREE.MeshStandardMaterial({
+      color: '#ffffff',
+      map: paintMap,
+      metalness: 0,
+      roughness: 0.86,
+      side: THREE.FrontSide
+    });
+  }
+
+  if (sceneObject.type === 'tile') {
+    return createTileRenderMaterial(sceneObject.material);
+  }
+
+  return new THREE.MeshStandardMaterial({
+    color: getObjectMaterialColor(sceneObject),
+    metalness: 0,
+    roughness: 0.86,
+    side: THREE.FrontSide
+  });
+}
+
+function getTextureRegionById(sceneObject, regionId) {
+  const texturePaint = ensureObjectTexturePaint(sceneObject);
+
+  if (!texturePaint) {
+    return null;
+  }
+
+  return getTextureRegions(sceneObject, texturePaint.width, texturePaint.height)
+    .find((region) => region.id === regionId) || null;
+}
+
+function setGeometryUvAt(uvs, index, u, v) {
+  uvs.setXY(index, Math.min(1, Math.max(0, u)), Math.min(1, Math.max(0, v)));
+}
+
+function storeGeometryPaintBasis(geometry) {
+  const positions = geometry.attributes.position;
+  const normals = geometry.attributes.normal;
+
+  if (!positions || !normals) {
+    return;
+  }
+
+  geometry.userData.paintBasePositions = new Float32Array(positions.array);
+  geometry.userData.paintBaseNormals = new Float32Array(normals.array);
+}
+
+function mapLocalUvToRegion(localU, localV, region, texturePaint) {
+  const imageX = region.x + (Math.min(1, Math.max(0, localU)) * region.width);
+  const imageY = region.y + ((1 - Math.min(1, Math.max(0, localV))) * region.height);
+
+  return {
+    u: imageX / texturePaint.width,
+    v: 1 - (imageY / texturePaint.height)
+  };
+}
+
+function applyBoxPaintUvs(geometry, sceneObject, width, height, depth) {
+  const texturePaint = ensureObjectTexturePaint(sceneObject);
+  const positions = geometry.attributes.position;
+  const normals = geometry.attributes.normal;
+  const uvs = geometry.attributes.uv;
+
+  if (!texturePaint || !positions || !normals || !uvs) {
+    return;
+  }
+
+  const position = new THREE.Vector3();
+  const normal = new THREE.Vector3();
+  const safeWidth = Math.max(width, 0.0001);
+  const safeHeight = Math.max(height, 0.0001);
+  const safeDepth = Math.max(depth, 0.0001);
+  const basePositions = geometry.userData.paintBasePositions;
+  const baseNormals = geometry.userData.paintBaseNormals;
+
+  for (let index = 0; index < positions.count; index += 1) {
+    if (basePositions) {
+      position.fromArray(basePositions, index * 3);
+    } else {
+      position.fromBufferAttribute(positions, index);
+    }
+
+    if (baseNormals) {
+      normal.fromArray(baseNormals, index * 3);
+    } else {
+      normal.fromBufferAttribute(normals, index);
+    }
+
+    const absX = Math.abs(normal.x);
+    const absY = Math.abs(normal.y);
+    const absZ = Math.abs(normal.z);
+    let faceId = 'z_pos';
+    let localU = (position.x / safeWidth) + 0.5;
+    let localV = (position.y / safeHeight) + 0.5;
+
+    if (absY >= absX && absY >= absZ) {
+      faceId = normal.y >= 0 ? 'y_pos' : 'y_neg';
+      localU = (position.x / safeWidth) + 0.5;
+      localV = (position.z / safeDepth) + 0.5;
+    } else if (absX >= absZ) {
+      faceId = normal.x >= 0 ? 'x_pos' : 'x_neg';
+      localU = (position.z / safeDepth) + 0.5;
+      localV = (position.y / safeHeight) + 0.5;
+    } else {
+      faceId = normal.z >= 0 ? 'z_pos' : 'z_neg';
+      localU = (position.x / safeWidth) + 0.5;
+      localV = (position.y / safeHeight) + 0.5;
+    }
+
+    const region = getTextureRegionById(sceneObject, faceId);
+
+    if (region) {
+      const uv = mapLocalUvToRegion(localU, localV, region, texturePaint);
+      setGeometryUvAt(uvs, index, uv.u, uv.v);
+    }
+  }
+
+  uvs.needsUpdate = true;
+}
+
+function createTileRenderGeometry(sceneObject, metrics) {
+  const geometry = createTileGeometry(
+    metrics.widthUnits,
+    metrics.heightUnits,
+    metrics.depthUnits,
+    sceneObject.rounding,
+    sceneObject.shape
+  );
+
+  if (hasObjectPaintTexture(sceneObject)) {
+    applyBoxPaintUvs(geometry, sceneObject, metrics.widthUnits, metrics.heightUnits, metrics.depthUnits);
+  }
+
+  return geometry;
 }
 
 function getAxisDimension(axis, width, height, depth) {
@@ -3267,7 +5215,201 @@ function createRoundedTileGeometry(width, height, depth, rounding) {
   return geometry;
 }
 
-function createTileGeometry(width, height, depth, rounding) {
+function getShapePolygonPoint(index, sides, width, depth) {
+  if (sides === 4) {
+    const corners = [
+      [-width / 2, -depth / 2],
+      [width / 2, -depth / 2],
+      [width / 2, depth / 2],
+      [-width / 2, depth / 2]
+    ];
+    const [x, z] = corners[index % corners.length];
+
+    return { x, z };
+  }
+
+  const angle = (-Math.PI / 2) + ((Math.PI * 2 * index) / sides);
+
+  return {
+    x: Math.cos(angle) * (width / 2),
+    z: Math.sin(angle) * (depth / 2)
+  };
+}
+
+function getShapeFaceUv(point, width, depth) {
+  return [
+    (point.x / Math.max(width, 0.0001)) + 0.5,
+    (point.z / Math.max(depth, 0.0001)) + 0.5
+  ];
+}
+
+function createTaperedTileGeometry(width, height, depth, shape) {
+  const normalizedShape = normalizeTileShape(shape);
+  const sides = normalizedShape.sides;
+  const bottomY = -height / 2;
+  const topY = height / 2;
+  const positions = [];
+  const uvs = [];
+  const bottom = [];
+  const top = [];
+  const perimeterU = [0];
+  let perimeter = 0;
+
+  for (let index = 0; index < sides; index += 1) {
+    const point = getShapePolygonPoint(index, sides, width, depth);
+    bottom.push({ x: point.x, y: bottomY, z: point.z });
+    top.push({
+      x: point.x,
+      y: topY,
+      z: point.z
+    });
+  }
+
+  for (let index = 0; index < sides; index += 1) {
+    const nextIndex = (index + 1) % sides;
+    perimeter += Math.hypot(
+      bottom[nextIndex].x - bottom[index].x,
+      bottom[nextIndex].z - bottom[index].z
+    );
+    perimeterU.push(perimeter);
+  }
+
+  const safePerimeter = Math.max(perimeter, 0.0001);
+
+  function pushVertex(vertex, uv) {
+    positions.push(vertex.x, vertex.y, vertex.z);
+    uvs.push(uv[0], uv[1]);
+  }
+
+  function pushTriangle(first, second, third, firstUv, secondUv, thirdUv) {
+    pushVertex(first, firstUv);
+    pushVertex(second, secondUv);
+    pushVertex(third, thirdUv);
+  }
+
+  const bottomCenter = { x: 0, y: bottomY, z: 0 };
+  const topCenter = { x: 0, y: topY, z: 0 };
+
+  for (let index = 0; index < sides; index += 1) {
+    const nextIndex = (index + 1) % sides;
+    const currentBottomUv = getShapeFaceUv(bottom[index], width, depth);
+    const nextBottomUv = getShapeFaceUv(bottom[nextIndex], width, depth);
+    const currentTopUv = getShapeFaceUv(top[index], width, depth);
+    const nextTopUv = getShapeFaceUv(top[nextIndex], width, depth);
+    const currentU = perimeterU[index] / safePerimeter;
+    const nextU = perimeterU[index + 1] / safePerimeter;
+
+    pushTriangle(
+      bottomCenter,
+      bottom[index],
+      bottom[nextIndex],
+      [0.5, 0.5],
+      currentBottomUv,
+      nextBottomUv
+    );
+
+    pushTriangle(
+      topCenter,
+      top[nextIndex],
+      top[index],
+      [0.5, 0.5],
+      nextTopUv,
+      currentTopUv
+    );
+    pushTriangle(
+      bottom[index],
+      top[nextIndex],
+      bottom[nextIndex],
+      [currentU, 0],
+      [nextU, 1],
+      [nextU, 0]
+    );
+    pushTriangle(
+      bottom[index],
+      top[index],
+      top[nextIndex],
+      [currentU, 0],
+      [currentU, 1],
+      [nextU, 1]
+    );
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.computeVertexNormals();
+  storeGeometryPaintBasis(geometry);
+  applyShapeFaceTapersToGeometry(geometry, width, height, depth, shape);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  return geometry;
+}
+
+function deformTaperedBoxPosition(position, width, height, depth, shape) {
+  const normalizedShape = normalizeTileShape(shape);
+  const half = {
+    x: width / 2,
+    y: height / 2,
+    z: depth / 2
+  };
+  shapeFaceDefinitions.forEach((face) => {
+    const percent = normalizedShape.faces[face.id];
+
+    if (percent <= 0.0001) {
+      return;
+    }
+
+    const axisHalf = Math.max(half[face.axis], 0.0001);
+    const influence = Math.min(1, Math.max(0, ((position[face.axis] * face.sign) + axisHalf) / (axisHalf * 2)));
+    const scale = Math.max(0, 1 - ((percent / 100) * influence));
+
+    ['x', 'y', 'z'].forEach((axis) => {
+      if (axis !== face.axis) {
+        position[axis] *= scale;
+      }
+    });
+  });
+
+}
+
+function applyShapeFaceTapersToGeometry(geometry, width, height, depth, shape) {
+  const positions = geometry.attributes.position;
+  const position = new THREE.Vector3();
+
+  for (let index = 0; index < positions.count; index += 1) {
+    position.fromBufferAttribute(positions, index);
+    deformTaperedBoxPosition(position, width, height, depth, shape);
+    positions.setXYZ(index, position.x, position.y, position.z);
+  }
+
+  positions.needsUpdate = true;
+}
+
+function createTaperedBoxTileGeometry(width, height, depth, rounding, shape) {
+  const geometry = hasTileRounding(rounding)
+    ? createRoundedTileGeometry(width, height, depth, rounding)
+    : new THREE.BoxGeometry(width, height, depth);
+
+  storeGeometryPaintBasis(geometry);
+  applyShapeFaceTapersToGeometry(geometry, width, height, depth, shape);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  return geometry;
+}
+
+function createTileGeometry(width, height, depth, rounding, shape) {
+  if (hasTileShape(shape)) {
+    if (normalizeTileShape(shape).sides === 4) {
+      return createTaperedBoxTileGeometry(width, height, depth, rounding, shape);
+    }
+
+    return createTaperedTileGeometry(width, height, depth, shape);
+  }
+
   if (!hasTileRounding(rounding)) {
     return new THREE.BoxGeometry(width, height, depth);
   }
@@ -3281,8 +5423,15 @@ function createExportTileMesh(sceneObject) {
   const depthUnits = (sceneObject.size?.depthPixels || tileSizePixels) / tileSizePixels;
   const heightPixels = sceneObject.size?.heightPixels || 1;
   const heightUnits = getTileHeightUnits(tileSizePixels, heightPixels);
-  const geometry = createTileGeometry(widthUnits, heightUnits, depthUnits, sceneObject.rounding);
-  const material = createTileRenderMaterial(sceneObject.material);
+  const metrics = {
+    tileSizePixels,
+    widthUnits,
+    depthUnits,
+    heightPixels,
+    heightUnits
+  };
+  const geometry = createTileRenderGeometry(sceneObject, metrics);
+  const material = createSceneObjectRenderMaterial(sceneObject);
   const mesh = new THREE.Mesh(geometry, material);
   const position = sceneObject.transform?.position || [0, heightUnits / 2, 0];
 
@@ -3296,6 +5445,53 @@ function createExportTileMesh(sceneObject) {
   mesh.scale.setScalar(getObjectUniformScale(sceneObject));
 
   return mesh;
+}
+
+function applyExportTransform(object3d, sceneObject, fallbackPosition = [0, 0, 0]) {
+  const position = sceneObject.transform?.position || fallbackPosition;
+
+  object3d.name = sceneObject.name || 'Objeto';
+  object3d.position.set(position[0], position[1], position[2]);
+  object3d.rotation.set(
+    THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[0])),
+    THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[1])),
+    THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[2]))
+  );
+  object3d.scale.setScalar(getObjectUniformScale(sceneObject));
+}
+
+function createExportPrimitiveMesh(sceneObject) {
+  const geometry = createPrimitiveGeometry(sceneObject);
+  const material = createSceneObjectRenderMaterial(sceneObject);
+  const mesh = new THREE.Mesh(geometry, material);
+
+  applyExportTransform(mesh, sceneObject, [0.5, 0.5, 0.5]);
+  return mesh;
+}
+
+function createExportModelMesh(sceneObject) {
+  const group = new THREE.Group();
+  const modelScene = cloneLoadedModelScene(sceneObject);
+
+  group.add(modelScene || createModelPlaceholder(sceneObject));
+  applyExportTransform(group, sceneObject, [0.5, 0.5, 0.5]);
+  return group;
+}
+
+function createExportSceneObject(sceneObject) {
+  if (sceneObject.type === 'tile') {
+    return createExportTileMesh(sceneObject);
+  }
+
+  if (sceneObject.type === 'sphere') {
+    return createExportPrimitiveMesh(sceneObject);
+  }
+
+  if (sceneObject.type === 'model') {
+    return createExportModelMesh(sceneObject);
+  }
+
+  return null;
 }
 
 function createExportLight(lightObject) {
@@ -3321,8 +5517,12 @@ function createProjectExportScene() {
       return;
     }
 
-    if (sceneObject.type === 'tile') {
-      root.add(createExportTileMesh(sceneObject));
+    if (isPaintableObjectType(sceneObject.type)) {
+      const exportedObject = createExportSceneObject(sceneObject);
+
+      if (exportedObject) {
+        root.add(exportedObject);
+      }
       return;
     }
 
@@ -3363,6 +5563,17 @@ function arrayBufferToBase64(buffer) {
   return window.btoa(binary);
 }
 
+async function ensureProjectModelsLoaded() {
+  const modelEntries = getSceneObjects()
+    .filter((object) => object.type === 'model')
+    .map((object) => getModelCacheEntry(object))
+    .filter((entry) => entry?.promise);
+
+  if (modelEntries.length > 0) {
+    await Promise.all(modelEntries.map((entry) => entry.promise));
+  }
+}
+
 async function exportActiveProjectGlb() {
   if (!state.activeProject) {
     showMessage('Abra ou crie um projeto antes de exportar.');
@@ -3374,6 +5585,7 @@ async function exportActiveProjectGlb() {
   try {
     elements.editorExportButton.disabled = true;
     await ensureTilesetImagesLoaded();
+    await ensureProjectModelsLoaded();
     exportScene = createProjectExportScene();
     const glbBuffer = await exportSceneToGlb(exportScene);
     const fileName = `${sanitizeExportFileName(state.activeProject.name)}.glb`;
@@ -3740,20 +5952,114 @@ function rotationOrZero(value) {
   return Number.isFinite(numericValue) ? numericValue : 0;
 }
 
-function createTileMesh(sceneObject) {
+function getTileRenderMetrics(sceneObject) {
   const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
   const widthUnits = (sceneObject.size?.widthPixels || tileSizePixels) / tileSizePixels;
   const depthUnits = (sceneObject.size?.depthPixels || tileSizePixels) / tileSizePixels;
   const heightPixels = sceneObject.size?.heightPixels || 1;
   const heightUnits = getTileHeightUnits(tileSizePixels, heightPixels);
-  const geometry = createTileGeometry(widthUnits, heightUnits, depthUnits, sceneObject.rounding);
-  const material = createTileRenderMaterial(sceneObject.material);
-  const mesh = new THREE.Mesh(geometry, material);
-  const position = sceneObject.transform?.position || [0, heightUnits / 2, 0];
+
+  return {
+    tileSizePixels,
+    widthUnits,
+    depthUnits,
+    heightPixels,
+    heightUnits
+  };
+}
+
+function getTileGeometryKey(sceneObject, metrics = getTileRenderMetrics(sceneObject)) {
+  const rounding = normalizeTileRounding(sceneObject.rounding);
+  const shape = normalizeTileShape(sceneObject.shape);
+  const roundingKey = roundingEdgeIds.map((edgeId) => rounding.edges[edgeId]).join(',');
+  const shapeFacesKey = shapeFaceIds.map((faceId) => shape.faces[faceId]).join(',');
+  const texturePaint = normalizeTexturePaint(sceneObject.texturePaint, getDefaultTextureLayoutType(sceneObject));
+  const paintKey = hasObjectPaintTexture(sceneObject)
+    ? `${texturePaint.layoutType}:${texturePaint.width}x${texturePaint.height}`
+    : 'no-paint';
+
+  return [
+    metrics.tileSizePixels,
+    metrics.widthUnits,
+    metrics.heightUnits,
+    metrics.depthUnits,
+    roundingKey,
+    shape.sides,
+    shapeFacesKey,
+    paintKey
+  ].join('|');
+}
+
+function removeTileSelectionOutline(mesh) {
+  const currentOutline = mesh.getObjectByName('tile-selection-outline');
+
+  if (!currentOutline) {
+    return;
+  }
+
+  mesh.remove(currentOutline);
+  currentOutline.geometry.dispose();
+  currentOutline.material.dispose();
+}
+
+function updateTileMeshGeometry(mesh, sceneObject, metrics) {
+  const geometryKey = getTileGeometryKey(sceneObject, metrics);
+
+  if (mesh.userData.geometryKey === geometryKey) {
+    return;
+  }
+
+  const previousGeometry = mesh.geometry;
+  removeTileSelectionOutline(mesh);
+  mesh.geometry = createTileRenderGeometry(sceneObject, metrics);
+  mesh.userData.geometryKey = geometryKey;
+
+  if (previousGeometry) {
+    previousGeometry.dispose();
+  }
+}
+
+function getTileMeshMaterialKey(sceneObject) {
+  if (hasObjectPaintTexture(sceneObject)) {
+    const texturePaint = normalizeTexturePaint(sceneObject.texturePaint, getDefaultTextureLayoutType(sceneObject));
+    return `paint:${sceneObject.id}:${texturePaint.layoutType}:${texturePaint.width}x${texturePaint.height}`;
+  }
+
+  const normalizedMaterial = normalizeTileMaterial(sceneObject.material);
+
+  if (!normalizedMaterial.texture) {
+    return getTileMaterialKey(normalizedMaterial);
+  }
+
+  const tileset = getTilesetById(normalizedMaterial.texture.tilesetId);
+  const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
+  const tilesetKey = tileset?.imageDataUrl ? getTilesetImageCacheKey(tileset) : 'missing';
+
+  return `${getTileMaterialKey(normalizedMaterial)}:${tileSizePixels}:${tilesetKey}`;
+}
+
+function updateTileMeshMaterial(mesh, sceneObject) {
+  const materialKey = getTileMeshMaterialKey(sceneObject);
+
+  if (mesh.userData.materialKey === materialKey) {
+    return;
+  }
+
+  const previousMaterial = mesh.material;
+  mesh.material = createSceneObjectRenderMaterial(sceneObject);
+  mesh.userData.materialKey = materialKey;
+
+  if (previousMaterial) {
+    disposeMaterial(previousMaterial);
+  }
+}
+
+function updateTileMeshTransform(mesh, sceneObject, metrics) {
+  const position = sceneObject.transform?.position || [0, metrics.heightUnits / 2, 0];
 
   mesh.name = sceneObject.name;
   mesh.userData.objectId = sceneObject.id;
-  mesh.userData.baseColor = getTileMaterialPreviewColor(sceneObject.material);
+  mesh.userData.baseColor = hasObjectPaintTexture(sceneObject) ? '#ffffff' : getTileMaterialPreviewColor(sceneObject.material);
   mesh.position.set(position[0], position[1], position[2]);
   mesh.rotation.set(
     THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[0])),
@@ -3762,8 +6068,359 @@ function createTileMesh(sceneObject) {
   );
   mesh.scale.setScalar(getObjectUniformScale(sceneObject));
   setTileMeshSelected(mesh, state.selectedObjectIds.has(sceneObject.id) || getSelectedGroup()?.objectIds.includes(sceneObject.id));
+}
+
+function updateTileMesh(mesh, sceneObject) {
+  const metrics = getTileRenderMetrics(sceneObject);
+
+  updateTileMeshGeometry(mesh, sceneObject, metrics);
+  updateTileMeshMaterial(mesh, sceneObject);
+  updateTileMeshTransform(mesh, sceneObject, metrics);
+}
+
+function createTileMesh(sceneObject) {
+  const metrics = getTileRenderMetrics(sceneObject);
+  const geometry = createTileRenderGeometry(sceneObject, metrics);
+  const material = createSceneObjectRenderMaterial(sceneObject);
+  const mesh = new THREE.Mesh(geometry, material);
+
+  mesh.userData.geometryKey = getTileGeometryKey(sceneObject, metrics);
+  mesh.userData.materialKey = getTileMeshMaterialKey(sceneObject);
+  updateTileMeshTransform(mesh, sceneObject, metrics);
 
   return mesh;
+}
+
+function getPrimitiveGeometryKey(sceneObject) {
+  const texturePaint = normalizeTexturePaint(sceneObject.texturePaint, getDefaultTextureLayoutType(sceneObject));
+  const paintKey = hasObjectPaintTexture(sceneObject)
+    ? `${texturePaint.layoutType}:${texturePaint.width}x${texturePaint.height}`
+    : 'no-paint';
+
+  return `${sceneObject.type}:${paintKey}`;
+}
+
+function getSceneObjectMaterialKey(sceneObject) {
+  if (sceneObject.type === 'tile') {
+    return getTileMeshMaterialKey(sceneObject);
+  }
+
+  if (hasObjectPaintTexture(sceneObject)) {
+    const texturePaint = normalizeTexturePaint(sceneObject.texturePaint, getDefaultTextureLayoutType(sceneObject));
+    return `paint:${sceneObject.id}:${texturePaint.layoutType}:${texturePaint.width}x${texturePaint.height}`;
+  }
+
+  return `color:${getObjectMaterialColor(sceneObject)}`;
+}
+
+function createPrimitiveGeometry(sceneObject) {
+  return new THREE.SphereGeometry(0.5, 48, 24);
+}
+
+function updateSceneObjectMeshTransform(mesh, sceneObject) {
+  const position = sceneObject.transform?.position || [0, 0, 0];
+
+  mesh.name = sceneObject.name;
+  mesh.userData.objectId = sceneObject.id;
+  mesh.userData.baseColor = hasObjectPaintTexture(sceneObject) ? '#ffffff' : getObjectMaterialColor(sceneObject);
+  mesh.position.set(position[0], position[1], position[2]);
+  mesh.rotation.set(
+    THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[0])),
+    THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[1])),
+    THREE.MathUtils.degToRad(rotationOrZero(sceneObject.transform?.rotation?.[2]))
+  );
+  mesh.scale.setScalar(getObjectUniformScale(sceneObject));
+}
+
+function createPrimitiveMesh(sceneObject) {
+  const geometry = createPrimitiveGeometry(sceneObject);
+  const material = createSceneObjectRenderMaterial(sceneObject);
+  const mesh = new THREE.Mesh(geometry, material);
+
+  mesh.userData.geometryKey = getPrimitiveGeometryKey(sceneObject);
+  mesh.userData.materialKey = getSceneObjectMaterialKey(sceneObject);
+  updateSceneObjectMeshTransform(mesh, sceneObject);
+  setTileMeshSelected(mesh, state.selectedObjectIds.has(sceneObject.id) || getSelectedGroup()?.objectIds.includes(sceneObject.id));
+
+  return mesh;
+}
+
+function updatePrimitiveMesh(mesh, sceneObject) {
+  const geometryKey = getPrimitiveGeometryKey(sceneObject);
+  const materialKey = getSceneObjectMaterialKey(sceneObject);
+
+  if (mesh.userData.geometryKey !== geometryKey) {
+    const previousGeometry = mesh.geometry;
+    removeTileSelectionOutline(mesh);
+    mesh.geometry = createPrimitiveGeometry(sceneObject);
+    mesh.userData.geometryKey = geometryKey;
+    previousGeometry?.dispose();
+  }
+
+  if (mesh.userData.materialKey !== materialKey) {
+    const previousMaterial = mesh.material;
+    mesh.material = createSceneObjectRenderMaterial(sceneObject);
+    mesh.userData.materialKey = materialKey;
+    disposeMaterial(previousMaterial);
+  }
+
+  updateSceneObjectMeshTransform(mesh, sceneObject);
+  setTileMeshSelected(mesh, state.selectedObjectIds.has(sceneObject.id) || getSelectedGroup()?.objectIds.includes(sceneObject.id));
+}
+
+function getModelCacheKey(sceneObject) {
+  const sourceModel = normalizeSourceModel(sceneObject.sourceModel);
+  return `${sourceModel.name}:${sourceModel.format}:${sourceModel.dataUrl.length}`;
+}
+
+function geometryHasUv(geometry) {
+  return Boolean(geometry?.attributes?.uv && geometry.attributes.uv.count > 0);
+}
+
+function modelSceneHasUv(root) {
+  let hasUv = false;
+
+  root.traverse((child) => {
+    if (child.isMesh && geometryHasUv(child.geometry)) {
+      hasUv = true;
+    }
+  });
+
+  return hasUv;
+}
+
+function addUvSegment(segments, first, second, maxSegments) {
+  if (segments.length >= maxSegments) {
+    return;
+  }
+
+  segments.push([first.x, first.y, second.x, second.y]);
+}
+
+function extractModelUvSegments(root) {
+  const maxSegments = 2400;
+  const segments = [];
+
+  root.traverse((child) => {
+    const geometry = child.isMesh ? child.geometry : null;
+    const uv = geometry?.attributes?.uv;
+
+    if (!uv || segments.length >= maxSegments) {
+      return;
+    }
+
+    const index = geometry.index;
+    const vertexCount = index ? index.count : uv.count;
+    const getUv = (vertexIndex) => {
+      const sourceIndex = index ? index.getX(vertexIndex) : vertexIndex;
+      return new THREE.Vector2(uv.getX(sourceIndex), uv.getY(sourceIndex));
+    };
+
+    for (let vertexIndex = 0; vertexIndex + 2 < vertexCount && segments.length < maxSegments; vertexIndex += 3) {
+      const first = getUv(vertexIndex);
+      const second = getUv(vertexIndex + 1);
+      const third = getUv(vertexIndex + 2);
+
+      addUvSegment(segments, first, second, maxSegments);
+      addUvSegment(segments, second, third, maxSegments);
+      addUvSegment(segments, third, first, maxSegments);
+    }
+  });
+
+  return segments;
+}
+
+function getModelCacheEntry(sceneObject) {
+  if (!sceneObject || sceneObject.type !== 'model') {
+    return null;
+  }
+
+  const sourceModel = normalizeSourceModel(sceneObject.sourceModel);
+  const cacheKey = getModelCacheKey(sceneObject);
+  let entry = viewport.modelCache.get(cacheKey);
+
+  if (entry) {
+    return entry;
+  }
+
+  entry = {
+    status: sourceModel.dataUrl ? 'loading' : 'missing',
+    sourceKey: cacheKey,
+    scene: null,
+    hasUv: false,
+    uvSegments: [],
+    error: null,
+    promise: null
+  };
+  viewport.modelCache.set(cacheKey, entry);
+
+  if (!sourceModel.dataUrl) {
+    return entry;
+  }
+
+  entry.promise = new Promise((resolve) => {
+    if (sourceModel.format === 'obj') {
+      fetch(sourceModel.dataUrl)
+        .then((response) => response.text())
+        .then((content) => {
+          const scene = objLoader.parse(content);
+          entry.status = 'loaded';
+          entry.scene = scene;
+          entry.hasUv = modelSceneHasUv(scene);
+          entry.uvSegments = extractModelUvSegments(scene);
+          syncProjectSceneToViewport();
+          renderTexturePanel();
+          resolve(entry);
+        })
+        .catch((error) => {
+          entry.status = 'error';
+          entry.error = error;
+          showMessage('Não foi possível carregar o modelo .obj importado.');
+          renderTexturePanel();
+          resolve(entry);
+        });
+      return;
+    }
+
+    gltfLoader.load(
+      sourceModel.dataUrl,
+      (gltf) => {
+        entry.status = 'loaded';
+        entry.scene = gltf.scene;
+        entry.hasUv = modelSceneHasUv(gltf.scene);
+        entry.uvSegments = extractModelUvSegments(gltf.scene);
+        syncProjectSceneToViewport();
+        renderTexturePanel();
+        resolve(entry);
+      },
+      undefined,
+      (error) => {
+        entry.status = 'error';
+        entry.error = error;
+        showMessage('Não foi possível carregar o modelo importado.');
+        renderTexturePanel();
+        resolve(entry);
+      }
+    );
+  });
+
+  return entry;
+}
+
+function getModelUvSegments(sceneObject) {
+  return getModelCacheEntry(sceneObject)?.uvSegments || [];
+}
+
+function cloneLoadedModelScene(sceneObject) {
+  const entry = getModelCacheEntry(sceneObject);
+
+  if (entry?.status !== 'loaded' || !entry.scene) {
+    return null;
+  }
+
+  const clone = entry.scene.clone(true);
+
+  clone.traverse((child) => {
+    if (!child.isMesh) {
+      return;
+    }
+
+    child.geometry = child.geometry?.clone();
+    child.material = createSceneObjectRenderMaterial(sceneObject);
+    child.userData = {
+      ...child.userData,
+      objectId: sceneObject.id
+    };
+    child.castShadow = true;
+    child.receiveShadow = true;
+  });
+
+  return clone;
+}
+
+function clearGroupChildren(group) {
+  [...group.children].forEach((child) => {
+    group.remove(child);
+    disposeObjectTree(child);
+  });
+}
+
+function createModelPlaceholder(sceneObject) {
+  const geometry = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+  const material = new THREE.MeshStandardMaterial({
+    color: getObjectMaterialColor(sceneObject),
+    metalness: 0,
+    roughness: 0.86,
+    transparent: true,
+    opacity: 0.46
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+
+  mesh.userData.objectId = sceneObject.id;
+  return mesh;
+}
+
+function updateModelGroupContent(group, sceneObject) {
+  const entry = getModelCacheEntry(sceneObject);
+  const materialKey = getSceneObjectMaterialKey(sceneObject);
+  const contentKey = `${entry?.sourceKey || 'missing'}:${entry?.status || 'unknown'}:${materialKey}`;
+
+  if (group.userData.contentKey === contentKey) {
+    return;
+  }
+
+  clearGroupChildren(group);
+
+  const modelScene = cloneLoadedModelScene(sceneObject);
+  group.add(modelScene || createModelPlaceholder(sceneObject));
+  group.userData.contentKey = contentKey;
+}
+
+function createModelMesh(sceneObject) {
+  const group = new THREE.Group();
+
+  group.userData.objectId = sceneObject.id;
+  updateModelGroupContent(group, sceneObject);
+  updateSceneObjectMeshTransform(group, sceneObject);
+
+  return group;
+}
+
+function updateModelMesh(group, sceneObject) {
+  updateModelGroupContent(group, sceneObject);
+  updateSceneObjectMeshTransform(group, sceneObject);
+}
+
+function createSceneObjectMesh(sceneObject) {
+  if (sceneObject.type === 'tile') {
+    return createTileMesh(sceneObject);
+  }
+
+  if (sceneObject.type === 'sphere') {
+    return createPrimitiveMesh(sceneObject);
+  }
+
+  if (sceneObject.type === 'model') {
+    return createModelMesh(sceneObject);
+  }
+
+  return null;
+}
+
+function updateSceneObjectMesh(mesh, sceneObject) {
+  if (sceneObject.type === 'tile') {
+    updateTileMesh(mesh, sceneObject);
+    return;
+  }
+
+  if (sceneObject.type === 'sphere') {
+    updatePrimitiveMesh(mesh, sceneObject);
+    return;
+  }
+
+  if (sceneObject.type === 'model') {
+    updateModelMesh(mesh, sceneObject);
+  }
 }
 
 function createTileSelectionOutline(tileGeometry) {
@@ -3826,7 +6483,7 @@ function disposeMaterial(material) {
       return;
     }
 
-    if (item.map) {
+    if (item.map && !item.map.userData?.engineFlatCachedTexture && !item.map.userData?.engineFlatPaintTexture) {
       item.map.dispose();
     }
 
@@ -3849,6 +6506,10 @@ function disposeObjectTree(object) {
 function disposeTextureCache() {
   viewport.textureCache.forEach((texture) => texture.dispose());
   viewport.textureCache.clear();
+  viewport.paintTextureCache.forEach((texture) => texture.dispose());
+  viewport.paintTextureCache.clear();
+  viewport.paintCanvasCache.clear();
+  viewport.modelCache.clear();
   viewport.imageCache.clear();
 }
 
@@ -4083,11 +6744,48 @@ function getSelectedTransformBounds(object) {
     };
   }
 
+  if (object.type === 'model') {
+    const visualBounds = getSceneObjectVisualTransformBounds(object);
+
+    if (visualBounds) {
+      return visualBounds;
+    }
+  }
+
+  const scale = getObjectUniformScale(object);
+
   return {
     center: new THREE.Vector3(position[0], position[1], position[2]),
-    half: new THREE.Vector3(0.24, 0.24, 0.24),
-    radius: 0.7
+    half: new THREE.Vector3(0.5 * scale, 0.5 * scale, 0.5 * scale),
+    radius: Math.max(scale, 1) * 0.68
   };
+}
+
+function getSceneObjectVisualTransformBounds(object) {
+  const mesh = viewport.sceneObjectMeshes.get(object.id);
+
+  if (!mesh) {
+    return null;
+  }
+
+  mesh.updateWorldMatrix(true, true);
+
+  const box = new THREE.Box3().setFromObject(mesh);
+
+  if (box.isEmpty()) {
+    return null;
+  }
+
+  const center = new THREE.Vector3();
+  const size = new THREE.Vector3();
+
+  box.getCenter(center);
+  box.getSize(size);
+
+  const half = size.multiplyScalar(0.5);
+  const radius = Math.max(half.x * 2, half.y * 2, half.z * 2, 0.25) * 0.68;
+
+  return { center, half, radius };
 }
 
 function createResizeHandle(tile, axis, side, origin, direction) {
@@ -4208,6 +6906,9 @@ function createRotateHandle(object, axis, center, radius) {
       axis
     }
   };
+
+  group.position.copy(center);
+
   const torus = new THREE.Mesh(
     new THREE.TorusGeometry(radius, 0.012, 8, 96),
     new THREE.MeshBasicMaterial({
@@ -4218,7 +6919,6 @@ function createRotateHandle(object, axis, center, radius) {
     })
   );
 
-  torus.position.copy(center);
   torus.renderOrder = 20;
 
   const hitTorus = new THREE.Mesh(
@@ -4231,7 +6931,6 @@ function createRotateHandle(object, axis, center, radius) {
     })
   );
 
-  hitTorus.position.copy(center);
   hitTorus.renderOrder = 19;
 
   if (axis === 'x') {
@@ -4379,6 +7078,80 @@ function createRoundingHandle(tile, handleDefinition, bounds) {
   return group;
 }
 
+function getShapeFaceDefinition(faceId) {
+  return shapeFaceDefinitions.find((face) => face.id === faceId) || shapeFaceDefinitions[0];
+}
+
+function getShapeTaperBasis(tile, bounds, faceId = 'y_pos') {
+  const face = getShapeFaceDefinition(faceId);
+  const origin = bounds.center.clone();
+  const direction = getTransformAxisDirection(face.axis, face.sign);
+
+  origin[face.axis] += face.sign * bounds.half[face.axis];
+
+  return { origin, direction };
+}
+
+function createShapeHandle(tile, face, bounds) {
+  const group = new THREE.Group();
+  const { origin, direction } = getShapeTaperBasis(tile, bounds, face.id);
+  const color = getCssColor('--md-sys-color-tertiary');
+  const handleData = {
+    shapeHandle: {
+      targetType: 'object',
+      objectId: tile.id,
+      shapeHandleId: `face:${face.id}`,
+      shapeFaceId: face.id,
+      propertyKey: `shape-face-${face.id}`
+    }
+  };
+  const tipPosition = origin.clone().add(direction.clone().multiplyScalar(0.56));
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([origin, tipPosition]),
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.58,
+      depthTest: false
+    })
+  );
+  const grip = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.15, 0),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.92,
+      depthTest: false
+    })
+  );
+  const hitTarget = new THREE.Mesh(
+    new THREE.SphereGeometry(0.26, 18, 14),
+    new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.04,
+      depthTest: false
+    })
+  );
+
+  line.renderOrder = 20;
+  grip.position.copy(tipPosition);
+  grip.renderOrder = 21;
+  hitTarget.position.copy(tipPosition);
+  hitTarget.renderOrder = 20;
+
+  const visualParts = [line, grip, hitTarget];
+  prepareTransformHandlePart(line, 0.58, 1);
+  prepareTransformHandlePart(grip, 0.92, 1, 1.18);
+  prepareTransformHandlePart(hitTarget, 0.04, 0.22, 1.1);
+  attachTransformHandleTarget(line, handleData, visualParts);
+  attachTransformHandleTarget(grip, handleData, visualParts);
+  attachTransformHandleTarget(hitTarget, handleData, visualParts);
+  group.add(line, grip, hitTarget);
+
+  return group;
+}
+
 function renderTransformHandles() {
   clearTransformHandles();
 
@@ -4456,6 +7229,12 @@ function renderTransformHandles() {
     });
   }
 
+  if (state.viewportTool === 'shape' && !isGroupTarget && selectedObject?.type === 'tile') {
+    shapeFaceDefinitions.forEach((face) => {
+      handleGroup.add(createShapeHandle(selectedObject, face, bounds));
+    });
+  }
+
   if (handleGroup.children.length === 0) {
     return;
   }
@@ -4481,6 +7260,7 @@ function syncProjectSceneToViewport() {
 
     if (viewport.lightMarker) {
       viewport.scene.remove(viewport.lightMarker);
+      disposeObjectTree(viewport.lightMarker);
     }
 
     viewport.lightMarker = createLightMarker(
@@ -4494,21 +7274,48 @@ function syncProjectSceneToViewport() {
 
     if (viewport.lightMarker) {
       viewport.scene.remove(viewport.lightMarker);
+      disposeObjectTree(viewport.lightMarker);
       viewport.lightMarker = null;
     }
   }
 
-  disposeObjectTree(viewport.objectGroup);
-  viewport.objectGroup.clear();
-  viewport.sceneObjectMeshes.clear();
+  const previousMeshes = viewport.sceneObjectMeshes;
+  const nextMeshes = new Map();
 
   getSceneObjects()
-    .filter((object) => object.type === 'tile' && isObjectEffectivelyVisible(object))
+    .filter((object) => isPaintableObjectType(object.type) && isObjectEffectivelyVisible(object))
     .forEach((object) => {
-      const mesh = createTileMesh(object);
-      viewport.objectGroup.add(mesh);
-      viewport.sceneObjectMeshes.set(object.id, mesh);
+      let mesh = previousMeshes.get(object.id);
+
+      if (mesh && mesh.userData.sceneObjectType !== object.type) {
+        viewport.objectGroup.remove(mesh);
+        disposeObjectTree(mesh);
+        mesh = null;
+      }
+
+      if (!mesh) {
+        mesh = createSceneObjectMesh(object);
+      } else {
+        updateSceneObjectMesh(mesh, object);
+      }
+
+      if (mesh) {
+        mesh.userData.sceneObjectType = object.type;
+        viewport.objectGroup.add(mesh);
+        nextMeshes.set(object.id, mesh);
+      }
     });
+
+  previousMeshes.forEach((mesh, objectId) => {
+    if (nextMeshes.has(objectId)) {
+      return;
+    }
+
+    viewport.objectGroup.remove(mesh);
+    disposeObjectTree(mesh);
+  });
+
+  viewport.sceneObjectMeshes = nextMeshes;
   applyViewportSelectionState();
   renderTransformHandles();
 }
@@ -4560,7 +7367,7 @@ function moveSelectedLight(action) {
 }
 
 function isTileEditingToolActive() {
-  return state.activeTool === 'tile' || state.activeTool === 'bucket';
+  return state.activeTool === 'tile' || state.activeTool === 'sphere' || state.activeTool === 'bucket';
 }
 
 function renderViewportToolButtons() {
@@ -4569,7 +7376,8 @@ function renderViewportToolButtons() {
     move: elements.viewportMoveToolButton,
     rotate: elements.viewportRotateToolButton,
     scale: elements.viewportScaleToolButton,
-    round: elements.viewportRoundToolButton
+    round: elements.viewportRoundToolButton,
+    shape: elements.viewportShapeToolButton
   };
 
   Object.entries(buttons).forEach(([tool, button]) => {
@@ -4645,6 +7453,8 @@ function setViewportTool(tool) {
     viewportInteraction.lastPaintTargetKey = null;
     elements.addTileButton.classList.remove('tool-active');
     elements.addTileButton.setAttribute('aria-pressed', 'false');
+    elements.addSphereButton.classList.remove('tool-active');
+    elements.addSphereButton.setAttribute('aria-pressed', 'false');
     elements.stampToolButton.classList.remove('tool-active');
     elements.stampToolButton.setAttribute('aria-pressed', 'false');
     elements.bucketToolButton.classList.remove('tool-active');
@@ -4656,6 +7466,7 @@ function setViewportTool(tool) {
 
   renderViewportToolButtons();
   renderTransformHandles();
+  setPropertyAccordionOpen(getPropertySectionKeyForViewportTool());
 }
 
 function configureViewportControlsForTool() {
@@ -4688,11 +7499,13 @@ function setActiveTool(tool) {
   viewportInteraction.lastPaintTargetKey = null;
   elements.addTileButton.classList.toggle('tool-active', state.activeTool === 'tile');
   elements.addTileButton.setAttribute('aria-pressed', String(state.activeTool === 'tile'));
+  elements.addSphereButton.classList.toggle('tool-active', state.activeTool === 'sphere');
+  elements.addSphereButton.setAttribute('aria-pressed', String(state.activeTool === 'sphere'));
   elements.stampToolButton.classList.toggle('tool-active', state.activeTool === 'tile');
   elements.stampToolButton.setAttribute('aria-pressed', String(state.activeTool === 'tile'));
   elements.bucketToolButton.classList.toggle('tool-active', state.activeTool === 'bucket');
   elements.bucketToolButton.setAttribute('aria-pressed', String(state.activeTool === 'bucket'));
-  elements.sceneViewport.style.cursor = state.activeTool === 'tile' || state.activeTool === 'bucket' ? 'crosshair' : '';
+  elements.sceneViewport.style.cursor = isTileEditingToolActive() ? 'crosshair' : '';
 
   if (state.activeTool !== 'bucket') {
     clearBucketPreview();
@@ -4707,6 +7520,17 @@ function getTileAtCell(cellX, cellZ) {
   return getSceneObjects().find((object) => object.type === 'tile'
     && object.gridPosition?.[0] === cellX
     && object.gridPosition?.[1] === cellZ) || null;
+}
+
+function getSphereAtCell(cellX, cellZ) {
+  return getSceneObjects().find((object) => {
+    if (object.type !== 'sphere') {
+      return false;
+    }
+
+    const position = object.transform?.position || [0.5, 0.5, 0.5];
+    return Math.floor(position[0]) === cellX && Math.floor(position[2]) === cellZ;
+  }) || null;
 }
 
 function createTileObject(cellX, cellZ, name, material = getActiveTileMaterial()) {
@@ -4730,12 +7554,108 @@ function createTileObject(cellX, cellZ, name, material = getActiveTileMaterial()
     },
     material: cloneTileMaterial(material),
     rounding: setAllRoundingEdges(0),
+    shape: normalizeTileShape(),
     visible: true,
     locked: false,
     moveSnap: true,
     rotateSnap: true,
     resizeSnap: true
   };
+}
+
+function getNextObjectName(prefix, type) {
+  const count = getSceneObjects().filter((object) => object.type === type).length + 1;
+  return `${prefix} ${count}`;
+}
+
+function createSphereObject(cellX = 0, cellZ = 0, name = getNextObjectName('Esfera', 'sphere')) {
+  return {
+    id: `sphere-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    type: 'sphere',
+    gridPosition: [cellX, cellZ],
+    transform: {
+      position: [cellX + 0.5, 0.5, cellZ + 0.5],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1]
+    },
+    material: { color: defaultTileColor },
+    texturePaint: normalizeTexturePaint({}, 'sphere-equirect'),
+    visible: true,
+    locked: false,
+    moveSnap: true,
+    rotateSnap: true
+  };
+}
+
+function createImportedModelObject(file, dataUrl) {
+  const extension = file.name.split('.').pop()?.toLowerCase() || 'glb';
+
+  return {
+    id: `model-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: file.name.replace(/\.[^.]+$/, '') || getNextObjectName('Modelo', 'model'),
+    type: 'model',
+    transform: {
+      position: [0.5, 0.5, 0.5],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1]
+    },
+    material: { color: defaultTileColor },
+    texturePaint: normalizeTexturePaint({}, 'uv'),
+    sourceModel: {
+      name: file.name,
+      format: extension,
+      dataUrl
+    },
+    visible: true,
+    locked: false,
+    moveSnap: true,
+    rotateSnap: true
+  };
+}
+
+function addSceneObject(object) {
+  if (!state.activeProject || !object) {
+    showMessage('Abra ou crie um projeto antes de adicionar objetos.');
+    return;
+  }
+
+  setActiveTool('select');
+  state.activeProject.scene.objects.push(normalizeSceneObject(object, state.activeProject.grid.tileSizePixels));
+  setSelectedObjects([object.id], object.id);
+  syncProjectSceneToViewport();
+  renderObjectTree();
+  renderPropertiesPanel();
+  markEditorDirty();
+}
+
+function triggerModelImport() {
+  if (!state.activeProject) {
+    showMessage('Abra ou crie um projeto antes de importar um modelo.');
+    return;
+  }
+
+  elements.modelImportInput.value = '';
+  elements.modelImportInput.click();
+}
+
+async function importModelFile(file) {
+  if (!file) {
+    return;
+  }
+
+  const extension = file.name.split('.').pop()?.toLowerCase();
+
+  if (!['glb', 'gltf', 'obj'].includes(extension)) {
+    showMessage('Importe um arquivo .glb, .gltf autocontido ou .obj simples.');
+    return;
+  }
+
+  const dataUrl = await readFileAsDataUrl(file);
+  const object = createImportedModelObject(file, dataUrl);
+
+  addSceneObject(object);
+  showMessage(`Modelo importado: ${file.name}`);
 }
 
 function paintTileAtCell(cellX, cellZ) {
@@ -4758,6 +7678,42 @@ function paintTileAtCell(cellX, cellZ) {
 
   state.activeProject.scene.objects.push(tileObject);
   setSelectedObjects([tileObject.id], tileObject.id);
+  syncProjectSceneToViewport();
+  renderObjectTree();
+  renderPropertiesPanel();
+  markEditorDirty();
+}
+
+function placeSphereAtCell(cellX, cellZ) {
+  if (!state.activeProject) {
+    showMessage('Abra ou crie um projeto antes de adicionar esferas.');
+    return;
+  }
+
+  const existingTile = getTileAtCell(cellX, cellZ);
+
+  if (existingTile) {
+    setSelectedObjects([existingTile.id], existingTile.id);
+    renderObjectTree();
+    renderPropertiesPanel();
+    showMessage('Quadrado ocupado. Escolha um quadrado vazio para adicionar a esfera.');
+    return;
+  }
+
+  const existingSphere = getSphereAtCell(cellX, cellZ);
+
+  if (existingSphere) {
+    setSelectedObjects([existingSphere.id], existingSphere.id);
+    renderObjectTree();
+    renderPropertiesPanel();
+    return;
+  }
+
+  const sphereCount = getSceneObjects().filter((object) => object.type === 'sphere').length + 1;
+  const sphereObject = createSphereObject(cellX, cellZ, `Esfera ${sphereCount}`);
+
+  state.activeProject.scene.objects.push(sphereObject);
+  setSelectedObjects([sphereObject.id], sphereObject.id);
   syncProjectSceneToViewport();
   renderObjectTree();
   renderPropertiesPanel();
@@ -4932,11 +7888,11 @@ function renderBucketPreview(cells) {
   });
 
   cells.forEach((cell) => {
-    const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), fillMaterial.clone());
-    plane.rotation.x = -Math.PI / 2;
-    plane.position.set(cell.cellX + 0.5, 0.045, cell.cellZ + 0.5);
-    plane.renderOrder = 12;
-    group.add(plane);
+    const previewSurface = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), fillMaterial.clone());
+    previewSurface.rotation.x = -Math.PI / 2;
+    previewSurface.position.set(cell.cellX + 0.5, 0.045, cell.cellZ + 0.5);
+    previewSurface.renderOrder = 12;
+    group.add(previewSurface);
 
     const outline = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1)), edgeMaterial.clone());
     outline.rotation.x = -Math.PI / 2;
@@ -5020,6 +7976,18 @@ function activateTilePaintTool() {
     : 'Ferramenta Tile desativada.');
 }
 
+function activateSpherePaintTool() {
+  if (!state.activeProject) {
+    showMessage('Abra ou crie um projeto antes de adicionar esferas.');
+    return;
+  }
+
+  setActiveTool('sphere');
+  showMessage(state.activeTool === 'sphere'
+    ? 'Clique em um quadrado vazio da grade para adicionar uma esfera.'
+    : 'Ferramenta Esfera desativada.');
+}
+
 function activateBucketFillTool() {
   if (!state.activeProject) {
     showMessage('Abra ou crie um projeto antes de preencher tiles.');
@@ -5078,6 +8046,7 @@ function getTransformHandleIntersection(event) {
     || userData.moveHandle
     || userData.rotateHandle
     || userData.roundingHandle
+    || userData.shapeHandle
     || null;
 
   return handle
@@ -5089,7 +8058,7 @@ function getTransformHandleIntersection(event) {
 }
 
 function getViewportObjectIntersection(event) {
-  const tileMeshes = [...viewport.sceneObjectMeshes.values()];
+  const sceneMeshes = [...viewport.sceneObjectMeshes.values()];
   const lightMeshes = [];
 
   if (viewport.lightMarker) {
@@ -5100,13 +8069,13 @@ function getViewportObjectIntersection(event) {
     });
   }
 
-  if (tileMeshes.length === 0 && lightMeshes.length === 0) {
+  if (sceneMeshes.length === 0 && lightMeshes.length === 0) {
     return null;
   }
 
   updateViewportRayFromPointerEvent(event);
   const intersections = [
-    ...viewportInteraction.raycaster.intersectObjects(tileMeshes, false),
+    ...viewportInteraction.raycaster.intersectObjects(sceneMeshes, true),
     ...viewportInteraction.raycaster.intersectObjects(lightMeshes, false)
   ].sort((first, second) => first.distance - second.distance);
 
@@ -5266,6 +8235,35 @@ function getTransformAxisIndex(axis) {
   return axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
 }
 
+function getRotationQuaternion(rotation = [0, 0, 0]) {
+  return new THREE.Quaternion().setFromEuler(new THREE.Euler(
+    THREE.MathUtils.degToRad(rotationOrZero(rotation[0])),
+    THREE.MathUtils.degToRad(rotationOrZero(rotation[1])),
+    THREE.MathUtils.degToRad(rotationOrZero(rotation[2])),
+    'XYZ'
+  ));
+}
+
+function getRotationDegreesFromQuaternion(quaternion) {
+  const euler = new THREE.Euler().setFromQuaternion(quaternion.normalize(), 'XYZ');
+
+  return [euler.x, euler.y, euler.z].map((radians) => {
+    const degrees = THREE.MathUtils.radToDeg(radians);
+    const rounded = Number(degrees.toFixed(3));
+    return Object.is(rounded, -0) ? 0 : rounded;
+  });
+}
+
+function getRotationWithWorldDelta(startRotation, axisWorld, deltaDegrees) {
+  const rotationQuaternion = getRotationQuaternion(startRotation);
+  const deltaQuaternion = new THREE.Quaternion().setFromAxisAngle(
+    axisWorld.clone().normalize(),
+    THREE.MathUtils.degToRad(deltaDegrees)
+  );
+
+  return getRotationDegreesFromQuaternion(rotationQuaternion.premultiply(deltaQuaternion));
+}
+
 function cloneGroupObjectTransforms(group) {
   return getGroupObjects(group).map((object) => ({
     id: object.id,
@@ -5357,6 +8355,29 @@ function applyGroupRotationFromStart(group, startObjects, center, axisIndex, del
     rotation[axisIndex] = Number((rotationOrZero(rotation[axisIndex]) + deltaDegrees).toFixed(3));
     setObjectPositionFromVector(object, nextPosition);
     object.transform.rotation = rotation;
+  });
+
+  getGroupTransformBounds(group);
+}
+
+function applyGroupWorldRotationFromStart(group, startObjects, center, axisWorld, deltaDegrees) {
+  const radians = THREE.MathUtils.degToRad(deltaDegrees);
+  const normalizedAxis = axisWorld.clone().normalize();
+
+  startObjects.forEach((startObject) => {
+    const object = getObjectById(startObject.id);
+
+    if (!object) {
+      return;
+    }
+
+    const nextPosition = startObject.position.clone()
+      .sub(center)
+      .applyAxisAngle(normalizedAxis, radians)
+      .add(center);
+
+    setObjectPositionFromVector(object, nextPosition);
+    object.transform.rotation = getRotationWithWorldDelta(startObject.rotation, normalizedAxis, deltaDegrees);
   });
 
   getGroupTransformBounds(group);
@@ -5663,7 +8684,8 @@ function beginObjectRotate(event, handle) {
       startClientY: event.clientY,
       startCenter: getGroupTransformBounds(group).center.clone(),
       startObjects: cloneGroupObjectTransforms(group),
-      startRotation: [...(group.transform?.rotation || [0, 0, 0])]
+      startRotation: [...(group.transform?.rotation || [0, 0, 0])],
+      startAxisWorld: getAxisVectorByIndex(getTransformAxisIndex(handle.axis))
     };
 
     if (viewport.controls) {
@@ -5709,22 +8731,19 @@ function updateObjectRotate(event) {
       return;
     }
 
-    const axisIndex = drag.axis === 'x' ? 0 : drag.axis === 'y' ? 1 : 2;
     const pointerDelta = (event.clientX - drag.startClientX) + (drag.startClientY - event.clientY);
-    const nextRotation = rotationOrZero(drag.startRotation[axisIndex]) + (pointerDelta * 0.5);
-    const snappedRotation = Number(snapRotationDegrees(nextRotation, group).toFixed(3));
-    const rotation = [...drag.startRotation];
-    rotation[axisIndex] = snappedRotation;
+    const snappedDelta = Number(snapRotationDegrees(pointerDelta * 0.5, group).toFixed(3));
+    const rotation = getRotationWithWorldDelta(drag.startRotation, drag.startAxisWorld, snappedDelta);
     group.transform = {
       ...group.transform,
       rotation
     };
-    applyGroupRotationFromStart(
+    applyGroupWorldRotationFromStart(
       group,
       drag.startObjects,
       drag.startCenter,
-      axisIndex,
-      snappedRotation - rotationOrZero(drag.startRotation[axisIndex])
+      drag.startAxisWorld,
+      snappedDelta
     );
     syncProjectSceneToViewport();
     renderPropertiesPanel();
@@ -5738,11 +8757,13 @@ function updateObjectRotate(event) {
     return;
   }
 
-  const axisIndex = drag.axis === 'x' ? 0 : drag.axis === 'y' ? 1 : 2;
   const pointerDelta = (event.clientX - drag.startClientX) + (drag.startClientY - event.clientY);
-  const rotation = [...drag.startRotation];
-  const nextRotation = rotationOrZero(drag.startRotation[axisIndex]) + (pointerDelta * 0.5);
-  rotation[axisIndex] = Number(snapRotationDegrees(nextRotation, object).toFixed(3));
+  const snappedDelta = Number(snapRotationDegrees(pointerDelta * 0.5, object).toFixed(3));
+  const rotation = getRotationWithWorldDelta(
+    drag.startRotation,
+    getAxisVectorByIndex(getTransformAxisIndex(drag.axis)),
+    snappedDelta
+  );
   object.transform = {
     ...object.transform,
     rotation
@@ -5855,6 +8876,84 @@ function endRoundingDrag(event) {
   }
 
   viewportInteraction.roundDrag = null;
+
+  if (elements.sceneViewport.hasPointerCapture(event.pointerId)) {
+    elements.sceneViewport.releasePointerCapture(event.pointerId);
+  }
+
+  if (viewport.controls) {
+    configureViewportControlsForTool();
+  }
+}
+
+function beginShapeDrag(event, handle) {
+  const object = getObjectById(handle.objectId);
+
+  if (!object || object.type !== 'tile' || isObjectEffectivelyLocked(object)) {
+    return false;
+  }
+
+  const bounds = getSelectedTransformBounds(object);
+  const faceId = shapeFaceIds.includes(handle.shapeFaceId) ? handle.shapeFaceId : 'y_pos';
+  const { origin, direction } = getShapeTaperBasis(object, bounds, faceId);
+  const originScreen = projectWorldToViewportPoint(origin);
+  const tipScreen = projectWorldToViewportPoint(origin.clone().add(direction));
+  const screenDirection = tipScreen.clone().sub(originScreen);
+
+  if (screenDirection.lengthSq() < 0.0001) {
+    screenDirection.set(0, -1);
+  } else {
+    screenDirection.normalize();
+  }
+
+  viewportInteraction.shapeDrag = {
+    ...handle,
+    shapeFaceId: faceId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startValue: getShapeFaceValue(object.shape, faceId),
+    screenDirection
+  };
+
+  if (viewport.controls) {
+    viewport.controls.enabled = false;
+  }
+
+  elements.sceneViewport.setPointerCapture(event.pointerId);
+  return true;
+}
+
+function updateShapeDrag(event) {
+  const drag = viewportInteraction.shapeDrag;
+
+  if (!drag) {
+    return;
+  }
+
+  const object = getObjectById(drag.objectId);
+
+  if (!object || object.type !== 'tile' || isObjectEffectivelyLocked(object)) {
+    return;
+  }
+
+  const delta = new THREE.Vector2(
+    event.clientX - drag.startClientX,
+    event.clientY - drag.startClientY
+  );
+  const nextValue = drag.startValue + (delta.dot(drag.screenDirection) * 0.45);
+
+  object.shape = setTileShapeValue(object.shape, drag.propertyKey || 'shape-taper', nextValue);
+  syncProjectSceneToViewport();
+  renderPropertiesPanel();
+  markEditorDirty();
+}
+
+function endShapeDrag(event) {
+  if (!viewportInteraction.shapeDrag) {
+    return;
+  }
+
+  viewportInteraction.shapeDrag = null;
 
   if (elements.sceneViewport.hasPointerCapture(event.pointerId)) {
     elements.sceneViewport.releasePointerCapture(event.pointerId);
@@ -6133,6 +9232,23 @@ function paintTileFromPointerEvent(event) {
   paintTileAtCell(cell.cellX, cell.cellZ);
 }
 
+function paintSphereFromPointerEvent(event) {
+  const cell = getViewportCellFromPointerEvent(event);
+
+  if (!cell) {
+    return;
+  }
+
+  const targetKey = `sphere-cell:${getCellKey(cell)}`;
+
+  if (viewportInteraction.lastPaintTargetKey === targetKey) {
+    return;
+  }
+
+  viewportInteraction.lastPaintTargetKey = targetKey;
+  placeSphereAtCell(cell.cellX, cell.cellZ);
+}
+
 function handleViewportPointerDown(event) {
   const transformHandle = event.button === 0 ? getTransformHandleIntersection(event) : null;
 
@@ -6147,6 +9263,11 @@ function handleViewportPointerDown(event) {
 
     if (transformHandle.roundingHandleId && state.viewportTool === 'round') {
       beginRoundingDrag(event, transformHandle);
+      return;
+    }
+
+    if (transformHandle.shapeHandleId && state.viewportTool === 'shape') {
+      beginShapeDrag(event, transformHandle);
       return;
     }
 
@@ -6168,7 +9289,7 @@ function handleViewportPointerDown(event) {
     return;
   }
 
-  if ((state.activeTool !== 'tile' && state.activeTool !== 'bucket') || !viewport.initialized) {
+  if ((state.activeTool !== 'tile' && state.activeTool !== 'sphere' && state.activeTool !== 'bucket') || !viewport.initialized) {
     if (viewport.initialized && event.button === 0) {
       beginViewportObjectSelection(event);
     }
@@ -6198,6 +9319,18 @@ function handleViewportPointerDown(event) {
       applyBucketFillAtCell(cell.cellX, cell.cellZ);
     }
 
+    return;
+  }
+
+  if (state.activeTool === 'sphere') {
+    if (event.button !== 0) {
+      return;
+    }
+
+    viewportInteraction.isPaintingTiles = true;
+    viewportInteraction.lastPaintTargetKey = null;
+    elements.sceneViewport.setPointerCapture(event.pointerId);
+    paintSphereFromPointerEvent(event);
     return;
   }
 
@@ -6233,6 +9366,12 @@ function handleViewportPointerDown(event) {
 }
 
 function handleViewportPointerMove(event) {
+  if (viewportInteraction.shapeDrag) {
+    event.preventDefault();
+    updateShapeDrag(event);
+    return;
+  }
+
   if (viewportInteraction.roundDrag) {
     event.preventDefault();
     updateRoundingDrag(event);
@@ -6276,15 +9415,24 @@ function handleViewportPointerMove(event) {
     return;
   }
 
-  if (state.activeTool !== 'tile' || !viewportInteraction.isPaintingTiles) {
+  if ((state.activeTool !== 'tile' && state.activeTool !== 'sphere') || !viewportInteraction.isPaintingTiles) {
     return;
   }
 
   event.preventDefault();
-  paintTileFromPointerEvent(event);
+  if (state.activeTool === 'sphere') {
+    paintSphereFromPointerEvent(event);
+  } else {
+    paintTileFromPointerEvent(event);
+  }
 }
 
 function handleViewportPointerUp(event) {
+  if (viewportInteraction.shapeDrag) {
+    endShapeDrag(event);
+    return;
+  }
+
   if (viewportInteraction.roundDrag) {
     endRoundingDrag(event);
     return;
@@ -6328,7 +9476,7 @@ function handleViewportPointerUp(event) {
 }
 
 function handleViewportPointerLeave() {
-  if (viewportInteraction.resizeDrag || viewportInteraction.moveDrag || viewportInteraction.rotateDrag || viewportInteraction.groupResizeDrag || viewportInteraction.roundDrag) {
+  if (viewportInteraction.resizeDrag || viewportInteraction.moveDrag || viewportInteraction.rotateDrag || viewportInteraction.groupResizeDrag || viewportInteraction.roundDrag || viewportInteraction.shapeDrag) {
     return;
   }
 
@@ -6340,7 +9488,7 @@ function handleViewportPointerLeave() {
 }
 
 function handleViewportContextMenu(event) {
-  if (state.activeTool === 'tile' || state.activeTool === 'bucket') {
+  if (state.activeTool === 'tile' || state.activeTool === 'sphere' || state.activeTool === 'bucket') {
     event.preventDefault();
   }
 }
@@ -6677,6 +9825,14 @@ elements.deleteTilesetModal.addEventListener('click', (event) => {
   }
 });
 elements.propertyFields.addEventListener('click', (event) => {
+  const sectionSummary = event.target.closest('[data-property-section-summary]');
+
+  if (sectionSummary) {
+    event.preventDefault();
+    setPropertyAccordionOpen(sectionSummary.dataset.propertySectionSummary);
+    return;
+  }
+
   const actionButton = event.target.closest('button[data-light-action]');
 
   if (actionButton) {
@@ -6684,6 +9840,14 @@ elements.propertyFields.addEventListener('click', (event) => {
   }
 });
 elements.propertyFields.addEventListener('keydown', (event) => {
+  const sectionSummary = event.target.closest('[data-property-section-summary]');
+
+  if (sectionSummary && (event.key === 'Enter' || event.key === ' ')) {
+    event.preventDefault();
+    setPropertyAccordionOpen(sectionSummary.dataset.propertySectionSummary);
+    return;
+  }
+
   const propertyInput = event.target.closest('input[data-property-key]');
 
   if (!propertyInput) {
@@ -6802,6 +9966,44 @@ elements.tileSetImageInput.addEventListener('change', async () => {
     elements.tileSetImageInput.value = '';
   }
 });
+elements.modelImportInput.addEventListener('change', async () => {
+  try {
+    await importModelFile(elements.modelImportInput.files?.[0]);
+  } catch (error) {
+    showMessage(error.message || 'Não foi possível importar o modelo.');
+  } finally {
+    elements.modelImportInput.value = '';
+  }
+});
+elements.textureBucketToolButton.addEventListener('click', () => setTextureTool('bucket'));
+elements.textureBrushToolButton.addEventListener('click', () => setTextureTool('brush'));
+elements.textureEraserToolButton.addEventListener('click', () => setTextureTool('eraser'));
+elements.textureColorPicker.addEventListener('input', () => {
+  state.texturePaintColor = normalizeHexColor(elements.textureColorPicker.value);
+});
+elements.textureBrushSizeInput.addEventListener('input', () => {
+  state.textureBrushSize = Math.max(2, Number(elements.textureBrushSizeInput.value) || 14);
+});
+elements.textureZoomOutButton?.addEventListener('click', () => zoomTextureCanvas(1 / textureZoomStep));
+elements.textureZoomInButton?.addEventListener('click', () => zoomTextureCanvas(textureZoomStep));
+elements.textureCanvas.addEventListener('pointerdown', beginTextureCanvasPaint);
+elements.textureCanvas.addEventListener('pointermove', updateTextureCanvasPaint);
+elements.textureCanvas.addEventListener('pointerup', endTextureCanvasPaint);
+elements.textureCanvas.addEventListener('pointercancel', endTextureCanvasPaint);
+elements.textureCanvas.addEventListener('pointerleave', (event) => {
+  if (textureInteraction.isPainting) {
+    endTextureCanvasPaint(event);
+  }
+});
+elements.textureCanvasScroll.addEventListener('wheel', (event) => {
+  if (!getSelectedTextureObject()) {
+    return;
+  }
+
+  event.preventDefault();
+  const factor = event.deltaY > 0 ? 1 / textureZoomStep : textureZoomStep;
+  zoomTextureCanvas(factor, event);
+}, { passive: false });
 elements.collapseLeftPanelsButton.addEventListener('click', () => toggleSidebarCollapsed('left'));
 elements.collapseRightPanelsButton.addEventListener('click', () => toggleSidebarCollapsed('right'));
 updatePanelToolButtons();
@@ -6855,6 +10057,7 @@ elements.viewportSelectToolButton.addEventListener('click', () => setViewportToo
 elements.viewportMoveToolButton.addEventListener('click', () => setViewportTool('move'));
 elements.viewportRotateToolButton.addEventListener('click', () => setViewportTool('rotate'));
 elements.viewportScaleToolButton.addEventListener('click', () => setViewportTool('scale'));
+elements.viewportShapeToolButton.addEventListener('click', () => setViewportTool('shape'));
 elements.viewportRoundToolItem.addEventListener('pointerenter', openRoundingModeMenu);
 elements.viewportRoundToolItem.addEventListener('pointerleave', scheduleRoundingModeMenuClose);
 elements.viewportRoundToolItem.addEventListener('focusin', openRoundingModeMenu);
@@ -6876,6 +10079,8 @@ elements.viewportRoundModeButtons.forEach((button) => {
 elements.stampToolButton.addEventListener('click', activateTilePaintTool);
 elements.bucketToolButton.addEventListener('click', activateBucketFillTool);
 elements.addTileButton.addEventListener('click', activateTilePaintTool);
+elements.addSphereButton.addEventListener('click', activateSpherePaintTool);
+elements.importModelButton.addEventListener('click', triggerModelImport);
 elements.refreshButton.addEventListener('click', refreshRecentProjects);
 elements.backHomeButton.addEventListener('click', () => setView('home'));
 elements.editorExportButton.addEventListener('click', exportActiveProjectGlb);

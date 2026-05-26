@@ -14,6 +14,12 @@ const {
 
 let mainWindow;
 
+const appIconPath = path.join(
+  __dirname,
+  'assets',
+  process.platform === 'darwin' ? 'engine-flat.png' : 'engine-flat.ico'
+);
+
 function buildMenu() {
   Menu.setApplicationMenu(null);
 }
@@ -26,6 +32,7 @@ function createWindow() {
     minHeight: 620,
     backgroundColor: '#131318',
     title: 'Engine Flat',
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'preload.js'),
       contextIsolation: true,
@@ -37,6 +44,16 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  app.setName('Engine Flat');
+
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.engineflat.app');
+  }
+
+  if (app.dock) {
+    app.dock.setIcon(path.join(__dirname, 'assets', 'engine-flat.png'));
+  }
+
   buildMenu();
   createWindow();
 
