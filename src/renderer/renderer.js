@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
@@ -1185,11 +1185,16 @@ function getOutlinerObjectOrder() {
   const orderedObjects = [];
 
   getSceneGroups().forEach((group) => {
+    const isExpanded = isGroupExpanded(group.id);
+
     group.objectIds.forEach((objectId) => {
       const object = objectsById.get(objectId);
 
       if (object) {
         groupedObjectIds.add(objectId);
+      }
+
+      if (object && isExpanded) {
         orderedObjects.push(object);
       }
     });
@@ -4043,6 +4048,10 @@ function getGroupContainingObject(objectId) {
   return getSceneGroups().find((group) => group.objectIds.includes(objectId)) || null;
 }
 
+function isObjectInGroup(objectId) {
+  return Boolean(getGroupContainingObject(objectId));
+}
+
 function isObjectEffectivelyVisible(object) {
   const group = getGroupContainingObject(object.id);
   return getObjectVisibility(object) && getGroupVisibility(group);
@@ -4166,7 +4175,24 @@ function groupSelectedObjects() {
   }
 
   const groups = getSceneGroups();
-  const selectedObjectIds = new Set(objectIds);
+  const groupedObjectIds = [];
+  const objectIdsToGroup = [];
+
+  objectIds.forEach((objectId) => {
+    if (isObjectInGroup(objectId)) {
+      groupedObjectIds.push(objectId);
+      return;
+    }
+
+    objectIdsToGroup.push(objectId);
+  });
+
+  if (objectIdsToGroup.length === 0) {
+    showMessage('Desagrupe os itens antes de criar outro grupo com eles.');
+    return;
+  }
+
+  const selectedObjectIds = new Set(objectIdsToGroup);
 
   groups.forEach((group) => {
     group.objectIds = group.objectIds.filter((objectId) => !selectedObjectIds.has(objectId));
@@ -4187,7 +4213,7 @@ function groupSelectedObjects() {
     moveSnap: true,
     rotateSnap: true,
     resizeSnap: true,
-    objectIds
+    objectIds: objectIdsToGroup
   });
   state.expandedGroupIds.add(groupId);
 
@@ -4195,6 +4221,10 @@ function groupSelectedObjects() {
   renderObjectTree();
   renderPropertiesPanel();
   markEditorDirty();
+
+  if (groupedObjectIds.length > 0) {
+    showMessage('Grupo criado. Itens que ja estavam em grupos foram preservados.');
+  }
 }
 
 function renameGroup(groupId) {
@@ -4538,8 +4568,8 @@ async function createProjectFromModal(event) {
 
     closeNewProjectModal();
     setActiveProject(project);
-    await refreshRecentProjects();
     setView('editor');
+    await refreshRecentProjects();
     showMessage(`Projeto criado: ${project.name}`);
   } catch (error) {
     showMessage(error.message || 'Nao foi possivel criar o projeto.');
@@ -4629,8 +4659,8 @@ async function openProjectDialog() {
     }
 
     setActiveProject(project);
-    await refreshRecentProjects();
     setView('editor');
+    await refreshRecentProjects();
     showMessage(`Projeto aberto: ${project.name}`);
   } catch (error) {
     showMessage(error.message || 'Nao foi possivel abrir o projeto.');
@@ -4641,8 +4671,8 @@ async function openRecentProject(projectId) {
   try {
     const project = await window.engineFlat.projects.openRecent(projectId);
     setActiveProject(project);
-    await refreshRecentProjects();
     setView('editor');
+    await refreshRecentProjects();
     showMessage(`Projeto aberto: ${project.name}`);
   } catch (error) {
     showMessage(error.message || 'Nao foi possivel abrir o projeto.');
@@ -4770,6 +4800,20 @@ function sanitizeExportFileName(value) {
 
 function getTilesetImageCacheKey(tileset) {
   return `${tileset.id}:${tileset.imageDataUrl.length}:${tileset.imageWidth}x${tileset.imageHeight}`;
+}
+
+function getTilesetImageLoadStateKey(tileset) {
+  if (!tileset?.imageDataUrl) {
+    return 'no-image';
+  }
+
+  const cachedImage = viewport.imageCache.get(getTilesetImageCacheKey(tileset));
+
+  if (!cachedImage) {
+    return 'unrequested';
+  }
+
+  return cachedImage.complete && cachedImage.naturalWidth > 0 ? 'loaded' : 'loading';
 }
 
 function cacheTilesetImageElement(tileset, image) {
@@ -6034,8 +6078,9 @@ function getTileMeshMaterialKey(sceneObject) {
   const tileset = getTilesetById(normalizedMaterial.texture.tilesetId);
   const tileSizePixels = state.activeProject?.grid?.tileSizePixels || defaultTileSizePixels;
   const tilesetKey = tileset?.imageDataUrl ? getTilesetImageCacheKey(tileset) : 'missing';
+  const imageLoadKey = tileset ? getTilesetImageLoadStateKey(tileset) : 'missing';
 
-  return `${getTileMaterialKey(normalizedMaterial)}:${tileSizePixels}:${tilesetKey}`;
+  return `${getTileMaterialKey(normalizedMaterial)}:${tileSizePixels}:${tilesetKey}:${imageLoadKey}`;
 }
 
 function updateTileMeshMaterial(mesh, sceneObject) {
@@ -7475,6 +7520,9 @@ function configureViewportControlsForTool() {
   }
 
   viewport.controls.enabled = true;
+  viewport.controls.noRotate = false;
+  viewport.controls.noZoom = false;
+  viewport.controls.noPan = false;
 
   if (isTileEditingToolActive()) {
     viewport.controls.mouseButtons.LEFT = null;
@@ -7486,6 +7534,17 @@ function configureViewportControlsForTool() {
   viewport.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
   viewport.controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
   viewport.controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+}
+
+function setViewportControlsInteractionEnabled(isEnabled) {
+  if (!viewport.controls) {
+    return;
+  }
+
+  viewport.controls.enabled = true;
+  viewport.controls.noRotate = !isEnabled;
+  viewport.controls.noZoom = !isEnabled;
+  viewport.controls.noPan = !isEnabled;
 }
 
 function setActiveTool(tool) {
@@ -8546,7 +8605,7 @@ function beginObjectMove(event, handle) {
     };
 
     if (viewport.controls) {
-      viewport.controls.enabled = false;
+      setViewportControlsInteractionEnabled(false);
     }
 
     elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -8567,7 +8626,7 @@ function beginObjectMove(event, handle) {
   };
 
   if (viewport.controls) {
-    viewport.controls.enabled = false;
+    setViewportControlsInteractionEnabled(false);
   }
 
   elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -8689,7 +8748,7 @@ function beginObjectRotate(event, handle) {
     };
 
     if (viewport.controls) {
-      viewport.controls.enabled = false;
+      setViewportControlsInteractionEnabled(false);
     }
 
     elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -8710,7 +8769,7 @@ function beginObjectRotate(event, handle) {
   };
 
   if (viewport.controls) {
-    viewport.controls.enabled = false;
+    setViewportControlsInteractionEnabled(false);
   }
 
   elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -8838,7 +8897,7 @@ function beginRoundingDrag(event, handle) {
   };
 
   if (viewport.controls) {
-    viewport.controls.enabled = false;
+    setViewportControlsInteractionEnabled(false);
   }
 
   elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -8916,7 +8975,7 @@ function beginShapeDrag(event, handle) {
   };
 
   if (viewport.controls) {
-    viewport.controls.enabled = false;
+    setViewportControlsInteractionEnabled(false);
   }
 
   elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -8984,7 +9043,7 @@ function beginGroupResize(event, handle) {
   };
 
   if (viewport.controls) {
-    viewport.controls.enabled = false;
+    setViewportControlsInteractionEnabled(false);
   }
 
   elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -9121,7 +9180,7 @@ function beginTileResize(event, handle) {
   };
 
   if (viewport.controls) {
-    viewport.controls.enabled = false;
+    setViewportControlsInteractionEnabled(false);
   }
 
   elements.sceneViewport.setPointerCapture(event.pointerId);
@@ -9687,10 +9746,10 @@ function initViewport() {
   scene.add(objectGroup);
   camera.position.set(7, 5, 7);
 
-  const controls = new OrbitControls(camera, canvas);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.08;
-  controls.screenSpacePanning = false;
+  const controls = new TrackballControls(camera, canvas);
+  controls.staticMoving = false;
+  controls.dynamicDampingFactor = 0.08;
+  controls.keys = [];
   controls.target.set(0, 0, 0);
   controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
   controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
@@ -9754,6 +9813,7 @@ function resizeViewport() {
   viewport.camera.updateProjectionMatrix();
   viewport.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   viewport.renderer.setSize(clientWidth, clientHeight, false);
+  viewport.controls?.handleResize?.();
   resizeAxisGizmo();
 }
 
