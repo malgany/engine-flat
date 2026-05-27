@@ -1242,6 +1242,45 @@ button {
   color: var(--md-sys-color-on-surface-variant);
 }
 
+.creature-floating-tools {
+  position: absolute;
+  z-index: 4;
+  left: 28px;
+  top: 142px;
+  display: grid;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--md-sys-color-outline-variant) 72%, transparent);
+  border-radius: var(--md-sys-shape-corner-small);
+  background: color-mix(in srgb, var(--md-sys-color-surface-container) 78%, transparent);
+}
+
+.creature-floating-tool-button {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid transparent;
+  border-radius: var(--md-sys-shape-corner-small);
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: pointer;
+  padding: 0;
+}
+
+.creature-floating-tool-button:hover,
+.creature-floating-tool-button:focus-visible {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  outline: none;
+}
+
+.creature-floating-tool-button.tool-active {
+  border-color: color-mix(in srgb, var(--md-sys-color-primary) 68%, transparent);
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
 .viewport-tool-palette {
   position: absolute;
   z-index: 5;

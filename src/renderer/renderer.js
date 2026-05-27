@@ -34,6 +34,8 @@ const state = {
   creatureTabCreated: false,
   projectLeftPanelCollapsed: false,
   creatureLeftPanelCollapsed: false,
+  creatureMagneticMovement: false,
+  creatureLimbPlacement: false,
   viewportTool: 'select',
   roundingControlMode: 'edge',
   propertyAccordionOpenKey: 'basic',
@@ -85,13 +87,30 @@ const creatureViewport = {
   bodyGroup: null,
   skeletonGroup: null,
   bodyMeshes: [],
+  bodySurfaceTargets: [],
   arrowTargets: [],
+  jointTargets: [],
+  bodyScaleTargets: [],
+  limbAnchors: [],
+  limbControlsGroup: null,
+  limbJointTargets: [],
+  limbArrowTargets: [],
   raycaster: new THREE.Raycaster(),
   pointer: new THREE.Vector2(),
-  boneOffsets: [0],
+  boneNodes: [],
+  nodeBodyRadii: [],
+  selectedBodyNodeIndex: null,
   hoveredCreature: false,
   hoveredArrowDirection: null,
-  arrowDrag: null
+  arrowDrag: null,
+  bodyScaleDrag: null,
+  limbAnchorDrag: null,
+  limbArrowDrag: null,
+  selectedLimbAnchorId: null,
+  hoveredLimbArrowId: null,
+  settleTimer: null,
+  settleAnimationId: null,
+  pendingSettle: false
 };
 
 const viewportInteraction = {
@@ -431,6 +450,8 @@ const elements = {
   viewportProjectLabel: document.querySelector('#viewportProjectLabel'),
   sceneViewport: document.querySelector('#sceneViewport'),
   creatureViewport: document.querySelector('#creatureViewport'),
+  creatureMagneticMovementButton: document.querySelector('#creatureMagneticMovementButton'),
+  creatureLimbPlacementButton: document.querySelector('#creatureLimbPlacementButton'),
   snackbar: document.querySelector('#snackbar'),
   newProjectModal: document.querySelector('#newProjectModal'),
   newProjectForm: document.querySelector('#newProjectForm'),
@@ -1010,6 +1031,161 @@ function normalizeTilesets(tilesets) {
     }));
 }
 
+function normalizeNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function vectorToArray(vector) {
+  return [
+    normalizeNumber(vector?.x, 0),
+    normalizeNumber(vector?.y, 0),
+    normalizeNumber(vector?.z, 0)
+  ];
+}
+
+function normalizeVectorArray(value, fallback = [0, 0, 0]) {
+  if (!Array.isArray(fallback)) {
+    return Array.isArray(value) && value.length >= 3
+      ? [normalizeNumber(value[0], NaN), normalizeNumber(value[1], NaN), normalizeNumber(value[2], NaN)]
+      : null;
+  }
+
+  if (!Array.isArray(value)) {
+    return [...fallback];
+  }
+
+  return fallback.map((fallbackValue, index) => normalizeNumber(value[index], fallbackValue));
+}
+
+function normalizeCreatureLimbs(limbs) {
+  if (!Array.isArray(limbs)) {
+    return [];
+  }
+
+  return limbs
+    .map((limb, index) => {
+      const rawNodes = Array.isArray(limb?.nodes) ? limb.nodes : [];
+      const nodes = rawNodes
+        .map((node) => normalizeVectorArray(node, null))
+        .filter((node) => Array.isArray(node) && node.every((value) => Number.isFinite(value)))
+        .slice(0, creatureMaxBones + 1);
+      const point = normalizeVectorArray(limb?.point, null) || nodes[0];
+
+      if (!Array.isArray(point) || !point.every((value) => Number.isFinite(value))) {
+        return null;
+      }
+
+      if (!nodes.length) {
+        nodes.push([...point]);
+      }
+
+      nodes[0] = [...point];
+
+      return {
+        id: typeof limb?.id === 'string' && limb.id.trim() ? limb.id : `limb-${index}`,
+        point: [...point],
+        nodes
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeCreatureProjectState(creature) {
+  const rawNodes = Array.isArray(creature?.nodes) ? creature.nodes : [];
+  const nodes = rawNodes
+    .map((node) => normalizeVectorArray(node, null))
+    .filter((node) => Array.isArray(node) && node.every((value) => Number.isFinite(value)));
+  const normalizedNodes = nodes.length >= 2
+    ? nodes
+    : createInitialCreatureNodes().map((node) => vectorToArray(node));
+  const radii = Array.isArray(creature?.nodeBodyRadii)
+    ? creature.nodeBodyRadii.map((radius) => (
+      THREE.MathUtils.clamp(normalizeNumber(radius, creatureBodyRadius), creatureBodyMinRadius, creatureBodyMaxRadius)
+    ))
+    : [];
+
+  while (radii.length < normalizedNodes.length) {
+    radii.push(creatureBodyRadius);
+  }
+
+  if (radii.length > normalizedNodes.length) {
+    radii.length = normalizedNodes.length;
+  }
+
+  return {
+    version: 1,
+    nodes: normalizedNodes,
+    nodeBodyRadii: radii,
+    limbs: normalizeCreatureLimbs(creature?.limbs),
+    magneticMovement: creature?.magneticMovement === true,
+    limbPlacement: creature?.limbPlacement === true,
+    viewport: {
+      camera: {
+        position: normalizeVectorArray(creature?.viewport?.camera?.position, [4.2, 3.1, 6.2]),
+        target: normalizeVectorArray(creature?.viewport?.camera?.target, [0, 1.55, 0]),
+        up: normalizeVectorArray(creature?.viewport?.camera?.up, [0, 1, 0])
+      },
+      controls: {
+        target: normalizeVectorArray(creature?.viewport?.controls?.target, [0, 1.55, 0]),
+        radius: Math.min(11.6, Math.max(3.2, normalizeNumber(creature?.viewport?.controls?.radius, 6.8))),
+        yaw: normalizeNumber(creature?.viewport?.controls?.yaw, 0),
+        pitch: Math.min(1.28, Math.max(-0.12, normalizeNumber(creature?.viewport?.controls?.pitch, 0.36)))
+      }
+    }
+  };
+}
+
+function isVectorArrayNear(value, expected, threshold = 0.0001) {
+  return Array.isArray(value)
+    && Array.isArray(expected)
+    && value.length >= 3
+    && expected.length >= 3
+    && expected.every((expectedValue, index) => (
+      Math.abs(normalizeNumber(value[index], Infinity) - expectedValue) <= threshold
+    ));
+}
+
+function hasMeaningfulCreatureState(creature) {
+  if (!creature || typeof creature !== 'object') {
+    return false;
+  }
+
+  if (Array.isArray(creature.limbs) && creature.limbs.length > 0) {
+    return true;
+  }
+
+  if (creature.magneticMovement === true || creature.limbPlacement === true) {
+    return true;
+  }
+
+  const normalizedCreature = normalizeCreatureProjectState(creature);
+  const defaultNodes = createInitialCreatureNodes().map((node) => vectorToArray(node));
+
+  if (normalizedCreature.nodes.length !== defaultNodes.length) {
+    return true;
+  }
+
+  if (normalizedCreature.nodes.some((node, index) => !isVectorArrayNear(node, defaultNodes[index]))) {
+    return true;
+  }
+
+  return normalizedCreature.nodeBodyRadii.some((radius) => (
+    Math.abs(radius - creatureBodyRadius) > 0.0001
+  ));
+}
+
+function normalizeEditorState(editorState, creature) {
+  const activeEditorTab = editorState?.activeEditorTab === 'creature' ? 'creature' : 'project';
+  const hasExplicitCreatureTab = editorState?.creatureTabCreated === true || activeEditorTab === 'creature';
+  const hasLegacyCreatureData = !editorState && hasMeaningfulCreatureState(creature);
+
+  return {
+    activeEditorTab,
+    creatureTabCreated: hasExplicitCreatureTab || hasLegacyCreatureData
+  };
+}
+
 function normalizeProject(project) {
   const tileSizePixels = normalizeTileSizePixels(project.grid?.tileSizePixels);
   const sourceObjects = Array.isArray(project.scene?.objects)
@@ -1044,12 +1220,16 @@ function normalizeProject(project) {
     })).filter((group) => group.objectIds.length > 0)
     : [];
 
+  const creatureState = project.creature ? normalizeCreatureProjectState(project.creature) : null;
+
   return {
     ...project,
     grid: {
       tileSizePixels
     },
     tilesets: normalizeTilesets(project.tilesets),
+    creature: creatureState,
+    editorState: normalizeEditorState(project.editorState, project.creature),
     scene: {
       units: project.scene?.units || 'meters',
       objects,
@@ -1131,16 +1311,175 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function arrayToVector3(value, fallback = [0, 0, 0]) {
+  const vector = normalizeVectorArray(value, fallback);
+  return new THREE.Vector3(vector[0], vector[1], vector[2]);
+}
+
+function syncViewportCameraToProject() {
+  if (!state.activeProject || !viewport.initialized || !viewport.camera || !viewport.controls) {
+    return;
+  }
+
+  state.activeProject.scene = {
+    ...state.activeProject.scene,
+    camera: {
+      position: vectorToArray(viewport.camera.position),
+      target: vectorToArray(viewport.controls.target),
+      up: vectorToArray(viewport.camera.up)
+    }
+  };
+}
+
+function applyProjectCameraToViewport() {
+  if (!state.activeProject || !viewport.initialized || !viewport.camera || !viewport.controls) {
+    return;
+  }
+
+  const cameraState = state.activeProject.scene?.camera || {};
+  viewport.camera.position.copy(arrayToVector3(cameraState.position, [7, 5, 7]));
+  viewport.camera.up.copy(arrayToVector3(cameraState.up, [0, 1, 0]));
+  viewport.controls.target.copy(arrayToVector3(cameraState.target, [0, 0, 0]));
+  viewport.camera.lookAt(viewport.controls.target);
+  viewport.controls.syncFromCamera();
+}
+
+function serializeCreatureLimbs() {
+  return normalizeCreatureLimbs(creatureViewport.limbAnchors.map((limb) => ({
+    id: limb.id,
+    point: vectorToArray(limb.point),
+    nodes: limb.nodes.map((node) => vectorToArray(node))
+  })));
+}
+
+function deserializeCreatureLimbs(limbs) {
+  return normalizeCreatureLimbs(limbs).map((limb) => ({
+    id: limb.id,
+    point: arrayToVector3(limb.point),
+    nodes: limb.nodes.map((node) => arrayToVector3(node))
+  }));
+}
+
+function syncCreatureStateToProject() {
+  if (!state.activeProject) {
+    return;
+  }
+
+  if (!state.creatureTabCreated) {
+    state.activeProject.creature = null;
+    state.creatureMagneticMovement = false;
+    state.creatureLimbPlacement = false;
+    return;
+  }
+
+  const existingCreature = state.activeProject.creature || normalizeCreatureProjectState(null);
+
+  if (creatureViewport.initialized) {
+    creatureViewport.controls?.syncFromCamera();
+    ensureCreatureNodeBodyRadii();
+    state.activeProject.creature = normalizeCreatureProjectState({
+      ...existingCreature,
+      nodes: creatureViewport.boneNodes.map((node) => vectorToArray(node)),
+      nodeBodyRadii: [...creatureViewport.nodeBodyRadii],
+      limbs: serializeCreatureLimbs(),
+      magneticMovement: state.creatureMagneticMovement,
+      limbPlacement: state.creatureLimbPlacement,
+      viewport: {
+        camera: {
+          position: vectorToArray(creatureViewport.camera.position),
+          target: vectorToArray(creatureViewport.controls?.target || new THREE.Vector3(0, 1.55, 0)),
+          up: vectorToArray(creatureViewport.camera.up)
+        },
+        controls: {
+          target: vectorToArray(creatureViewport.controls?.target || new THREE.Vector3(0, 1.55, 0)),
+          radius: creatureViewport.controls?.radius,
+          yaw: creatureViewport.controls?.yaw,
+          pitch: creatureViewport.controls?.pitch
+        }
+      }
+    });
+    return;
+  }
+
+  state.activeProject.creature = normalizeCreatureProjectState({
+    ...existingCreature,
+    magneticMovement: state.creatureMagneticMovement,
+    limbPlacement: state.creatureLimbPlacement
+  });
+}
+
+function applyProjectCreatureStateToViewport() {
+  if (!state.activeProject) {
+    return;
+  }
+
+  const creatureState = normalizeCreatureProjectState(state.activeProject.creature);
+  state.creatureMagneticMovement = creatureState.magneticMovement;
+  state.creatureLimbPlacement = creatureState.limbPlacement;
+  updateCreatureMagneticMovementButton();
+  updateCreatureLimbPlacementButton();
+
+  if (!creatureViewport.initialized) {
+    return;
+  }
+
+  cancelCreatureSettle();
+  creatureViewport.boneNodes = creatureState.nodes.map((node) => arrayToVector3(node));
+  creatureViewport.nodeBodyRadii = [...creatureState.nodeBodyRadii];
+  creatureViewport.limbAnchors = deserializeCreatureLimbs(creatureState.limbs);
+  creatureViewport.selectedBodyNodeIndex = null;
+  creatureViewport.selectedLimbAnchorId = null;
+  creatureViewport.hoveredCreature = false;
+  creatureViewport.hoveredArrowDirection = null;
+  creatureViewport.hoveredLimbArrowId = null;
+  creatureViewport.arrowDrag = null;
+  creatureViewport.bodyScaleDrag = null;
+  creatureViewport.limbAnchorDrag = null;
+  creatureViewport.limbArrowDrag = null;
+
+  const cameraState = creatureState.viewport.camera;
+  const controlsState = creatureState.viewport.controls;
+  creatureViewport.camera.position.copy(arrayToVector3(cameraState.position, [4.2, 3.1, 6.2]));
+  creatureViewport.camera.up.copy(arrayToVector3(cameraState.up, [0, 1, 0]));
+  creatureViewport.controls.target.copy(arrayToVector3(controlsState.target || cameraState.target, [0, 1.55, 0]));
+  creatureViewport.controls.radius = controlsState.radius;
+  creatureViewport.controls.yaw = controlsState.yaw;
+  creatureViewport.controls.pitch = controlsState.pitch;
+  creatureViewport.controls.applyCameraTransform();
+  rebuildCreatureBody({ preserveHeight: true });
+}
+
+function syncEditorStateToProject() {
+  if (!state.activeProject) {
+    return;
+  }
+
+  state.activeProject.editorState = {
+    activeEditorTab: state.activeEditorTab,
+    creatureTabCreated: state.creatureTabCreated
+  };
+}
+
+function syncRuntimeProjectState() {
+  syncViewportCameraToProject();
+  syncCreatureStateToProject();
+  syncEditorStateToProject();
+}
+
 function getEditableProjectHistoryPayload() {
   if (!state.activeProject) {
     return null;
   }
 
+  syncRuntimeProjectState();
+
   return {
     description: state.activeProject.description || '',
     grid: cloneJson(state.activeProject.grid || {}),
     tilesets: cloneJson(state.activeProject.tilesets || []),
-    scene: cloneJson(state.activeProject.scene || {})
+    scene: cloneJson(state.activeProject.scene || {}),
+    creature: cloneJson(state.activeProject.creature || null),
+    editorState: cloneJson(state.activeProject.editorState || null)
   };
 }
 
@@ -1249,7 +1588,9 @@ function restoreEditorHistorySnapshot(snapshot) {
       description: payload.description,
       grid: payload.grid,
       tilesets: payload.tilesets,
-      scene: payload.scene
+      scene: payload.scene,
+      creature: payload.creature,
+      editorState: payload.editorState
     });
     elements.viewportProjectLabel.textContent = state.activeProject.description || 'Cena 3D inicial sem objeto.';
     reconcileSelectionAfterHistoryRestore(previousSelection);
@@ -1257,6 +1598,7 @@ function restoreEditorHistorySnapshot(snapshot) {
     renderObjectTree();
     renderPropertiesPanel();
     renderTileStylePanel();
+    applyProjectCreatureStateToViewport();
   } finally {
     state.history.isRestoring = false;
   }
@@ -1294,19 +1636,30 @@ function setActiveProject(project, options = {}) {
   const shouldPreserveEditorTabs = options.resetHistory === false;
   const previousEditorTab = state.activeEditorTab;
   const previousCreatureTabCreated = state.creatureTabCreated;
+  const rawHadCreatureTab = project?.editorState?.creatureTabCreated === true
+    || project?.editorState?.activeEditorTab === 'creature'
+    || (!project?.editorState && hasMeaningfulCreatureState(project?.creature));
   clearBucketPreview();
   disposeTextureCache();
   state.activeProject = normalizeProject(project);
   state.activeTilesetId = defaultTilesetId;
   state.pendingTilesetImportId = null;
-  state.creatureTabCreated = shouldPreserveEditorTabs ? previousCreatureTabCreated : false;
+  const savedEditorState = state.activeProject.editorState || {};
+  const savedCreatureTabCreated = savedEditorState.creatureTabCreated === true || rawHadCreatureTab;
+  state.creatureTabCreated = shouldPreserveEditorTabs ? previousCreatureTabCreated : savedCreatureTabCreated;
+  state.creatureMagneticMovement = state.activeProject.creature?.magneticMovement === true;
+  state.creatureLimbPlacement = state.activeProject.creature?.limbPlacement === true;
   state.expandedGroupIds = new Set(getSceneGroups().map((group) => group.id));
   setSelectedObjects(['scene-light']);
   elements.editorProjectName.textContent = state.activeProject.name;
   elements.viewportProjectTabName.textContent = state.activeProject.name;
   elements.viewportProjectLabel.textContent = state.activeProject.description || 'Cena 3D inicial sem objeto.';
   elements.editorSaveState.textContent = 'Salvo';
-  setEditorTab(shouldPreserveEditorTabs && previousCreatureTabCreated ? previousEditorTab : 'project');
+  setEditorTab(shouldPreserveEditorTabs && previousCreatureTabCreated
+    ? previousEditorTab
+    : savedEditorState.activeEditorTab || 'project');
+  updateCreatureMagneticMovementButton();
+  updateCreatureLimbPlacementButton();
   renderObjectTree();
   renderPropertiesPanel();
   renderTileStylePanel();
@@ -1319,7 +1672,12 @@ function setActiveProject(project, options = {}) {
   }
 
   if (viewport.initialized) {
+    applyProjectCameraToViewport();
     syncProjectSceneToViewport();
+  }
+
+  if (creatureViewport.initialized) {
+    applyProjectCreatureStateToViewport();
   }
 }
 
@@ -5053,6 +5411,84 @@ function captureViewportThumbnail() {
   }
 }
 
+function captureCreatureViewportThumbnail() {
+  if (
+    !creatureViewport.initialized
+    || !creatureViewport.renderer
+    || !creatureViewport.scene
+    || !creatureViewport.camera
+  ) {
+    return null;
+  }
+
+  const sourceCanvas = creatureViewport.renderer.domElement;
+
+  if (!sourceCanvas.width || !sourceCanvas.height) {
+    return null;
+  }
+
+  const hiddenObjects = [
+    creatureViewport.skeletonGroup,
+    creatureViewport.limbControlsGroup,
+    ...creatureViewport.arrowTargets,
+    ...creatureViewport.bodyScaleTargets
+  ].filter(Boolean);
+  const previousVisibility = hiddenObjects.map((object) => object.visible);
+
+  try {
+    hiddenObjects.forEach((object) => {
+      object.visible = false;
+    });
+    creatureViewport.renderer.render(creatureViewport.scene, creatureViewport.camera);
+
+    const thumbnailCanvas = document.createElement('canvas');
+    thumbnailCanvas.width = projectThumbnailWidthPixels;
+    thumbnailCanvas.height = projectThumbnailHeightPixels;
+
+    const context = thumbnailCanvas.getContext('2d');
+
+    if (!context) {
+      return null;
+    }
+
+    const crop = getCenteredCrop(
+      sourceCanvas.width,
+      sourceCanvas.height,
+      projectThumbnailWidthPixels / projectThumbnailHeightPixels
+    );
+
+    context.drawImage(
+      sourceCanvas,
+      crop.x,
+      crop.y,
+      crop.width,
+      crop.height,
+      0,
+      0,
+      projectThumbnailWidthPixels,
+      projectThumbnailHeightPixels
+    );
+
+    return thumbnailCanvas.toDataURL('image/webp', projectThumbnailQuality);
+  } catch {
+    return null;
+  } finally {
+    hiddenObjects.forEach((object, index) => {
+      object.visible = previousVisibility[index];
+    });
+    updateCreatureHandleVisibility();
+    creatureViewport.renderer.render(creatureViewport.scene, creatureViewport.camera);
+  }
+}
+
+function captureActiveEditorThumbnail() {
+  if (state.activeEditorTab === 'creature') {
+    return captureCreatureViewportThumbnail();
+  }
+
+  return captureViewportThumbnail();
+}
+
 async function saveActiveProject() {
   if (!state.activeProject) {
     showMessage('Abra ou crie um projeto antes de salvar.');
@@ -5060,12 +5496,15 @@ async function saveActiveProject() {
   }
 
   try {
-    const thumbnail = captureViewportThumbnail() || state.activeProject.thumbnail || null;
+    syncRuntimeProjectState();
+    const thumbnail = captureActiveEditorThumbnail() || state.activeProject.thumbnail || null;
     const project = await window.engineFlat.projects.save(state.activeProject.id, {
       description: state.activeProject.description,
       grid: state.activeProject.grid,
       tilesets: state.activeProject.tilesets,
       scene: state.activeProject.scene,
+      creature: state.activeProject.creature,
+      editorState: state.activeProject.editorState,
       thumbnail
     });
 
@@ -9965,8 +10404,21 @@ function handleEditorDeleteShortcut(event) {
     || event.altKey
     || isEditorModalOpen()
     || isEditableEventTarget(event.target)
-    || (state.selectedObjectIds.size === 0 && !state.selectedGroupId)
   ) {
+    return false;
+  }
+
+  if (state.activeEditorTab === 'creature') {
+    if (!creatureViewport.selectedLimbAnchorId) {
+      return false;
+    }
+
+    event.preventDefault();
+    removeCreatureLimbAnchor(creatureViewport.selectedLimbAnchorId);
+    return true;
+  }
+
+  if (state.selectedObjectIds.size === 0 && !state.selectedGroupId) {
     return false;
   }
 
@@ -10092,6 +10544,7 @@ function initViewport() {
   controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
   controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
   controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+  applyProjectCameraToViewport();
 
   const grid = new THREE.GridHelper(20, 20, 0x5d6068, 0x3f424a);
   grid.material.transparent = true;
@@ -10116,6 +10569,7 @@ function initViewport() {
   viewport.controls = controls;
   viewport.objectGroup = objectGroup;
   viewport.sceneLight = sceneLight;
+  applyProjectCameraToViewport();
   configureViewportControlsForTool();
   canvas.addEventListener('pointerdown', handleViewportPointerDown);
   canvas.addEventListener('pointermove', handleViewportPointerMove);
@@ -10235,11 +10689,32 @@ function createCreatureEnvironment(scene) {
   return platform;
 }
 
-const creatureBoneSpacing = 0.86;
-const creatureBoneLength = 1.06;
-const creatureBaseHeight = 1.62;
+const creatureBoneSpacing = 0.43;
+const creatureBaseHeight = 1.46;
 const creatureMaxBones = 4;
-const creatureBodyRadius = 0.72;
+const creatureBodyRadius = 0.36;
+const creatureBodyMinRadius = creatureBodyRadius * 0.5;
+const creatureBodyMaxRadius = creatureBodyRadius * 2;
+const creatureDepthLimit = 1.25;
+const creatureBodyRadialSegments = 48;
+const creatureBodyCapSegments = 10;
+const creatureGroundLimitY = 0.42;
+const creatureSettleDelayMs = 2000;
+const creatureSettleDurationMs = 520;
+const creatureArrowOffset = 0.43;
+const creatureBodyScaleHandleOffset = 0.52;
+const creatureJointHitRadius = 0.18;
+const creatureEndJointVisualRadius = 0.06;
+const creatureInnerJointVisualRadius = 0.05;
+const creatureMagneticAngleStep = THREE.MathUtils.degToRad(15);
+const creatureLimbBodyRadius = creatureBodyRadius * 0.34;
+const creatureLimbJointHitRadius = 0.18;
+const creatureLimbMirrorCenterThreshold = 0.045;
+const creatureLimbArrowOffset = 0.34;
+
+function getCreatureDefaultBottomNodeY() {
+  return creatureBaseHeight - (creatureBoneSpacing / 2);
+}
 
 function createCreatureLimb(direction) {
   const group = new THREE.Group();
@@ -10251,11 +10726,11 @@ function createCreatureLimb(direction) {
     roughness: 0.48,
     metalness: 0.06
   });
-  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.34, 12), material);
-  const head = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.28, 24), material);
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.22, 12), material);
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.085, 0.18, 24), material);
 
-  shaft.position.y = direction === 'up' ? 0.16 : -0.16;
-  head.position.y = direction === 'up' ? 0.46 : -0.46;
+  shaft.position.y = direction === 'up' ? 0.105 : -0.105;
+  head.position.y = direction === 'up' ? 0.29 : -0.29;
   if (direction === 'down') {
     head.rotation.x = Math.PI;
   }
@@ -10267,80 +10742,775 @@ function createCreatureLimb(direction) {
   return group;
 }
 
-function createCreatureSkeletonSegment(offset, materials) {
-  const group = new THREE.Group();
-  const y = creatureBaseHeight + (offset * creatureBoneSpacing);
-
-  const bone = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, creatureBoneLength, 14), materials.bone);
-  bone.position.y = y;
-  bone.userData.creatureSkeleton = true;
-
-  const topJoint = new THREE.Mesh(new THREE.SphereGeometry(0.075, 18, 12), materials.joint);
-  const bottomJoint = topJoint.clone();
-  topJoint.position.y = y + (creatureBoneLength / 2);
-  bottomJoint.position.y = y - (creatureBoneLength / 2);
-  topJoint.userData.creatureSkeleton = true;
-  bottomJoint.userData.creatureSkeleton = true;
-
-  group.add(bone, topJoint, bottomJoint);
-  return group;
+function createInitialCreatureNodes() {
+  return [
+    new THREE.Vector3(0, getCreatureDefaultBottomNodeY(), 0),
+    new THREE.Vector3(0, creatureBaseHeight + (creatureBoneSpacing / 2), 0)
+  ];
 }
 
-function createCreatureBodyMesh(sortedOffsets, material) {
-  const minOffset = Math.min(...sortedOffsets);
-  const maxOffset = Math.max(...sortedOffsets);
-  const minY = creatureBaseHeight + (minOffset * creatureBoneSpacing);
-  const maxY = creatureBaseHeight + (maxOffset * creatureBoneSpacing);
-  const bodyLength = Math.max(0.001, maxY - minY);
-  const geometry = new THREE.CapsuleGeometry(creatureBodyRadius, bodyLength, 18, 48);
-  const mesh = new THREE.Mesh(geometry, material);
+function ensureCreatureNodeBodyRadii() {
+  if (!Array.isArray(creatureViewport.nodeBodyRadii)) {
+    creatureViewport.nodeBodyRadii = [];
+  }
 
-  mesh.position.y = (minY + maxY) / 2;
-  mesh.scale.set(1.03, 0.92, 1.03);
-  mesh.userData.creatureBody = true;
+  while (creatureViewport.nodeBodyRadii.length < creatureViewport.boneNodes.length) {
+    creatureViewport.nodeBodyRadii.push(creatureBodyRadius);
+  }
+
+  if (creatureViewport.nodeBodyRadii.length > creatureViewport.boneNodes.length) {
+    creatureViewport.nodeBodyRadii.length = creatureViewport.boneNodes.length;
+  }
+
+  creatureViewport.nodeBodyRadii = creatureViewport.nodeBodyRadii.map((radius) => (
+    THREE.MathUtils.clamp(radius || creatureBodyRadius, creatureBodyMinRadius, creatureBodyMaxRadius)
+  ));
+}
+
+function smoothCreatureRadiusTransition(progress) {
+  const clampedProgress = THREE.MathUtils.clamp(progress, 0, 1);
+  return clampedProgress ** 3 * (clampedProgress * ((clampedProgress * 6) - 15) + 10);
+}
+
+function getCreatureRadiusAtProgress(nodeRadii, progress) {
+  if (!nodeRadii.length) {
+    return creatureBodyRadius;
+  }
+
+  if (nodeRadii.length === 1) {
+    return nodeRadii[0];
+  }
+
+  const scaledProgress = THREE.MathUtils.clamp(progress, 0, 1) * (nodeRadii.length - 1);
+  const startIndex = Math.floor(scaledProgress);
+  const endIndex = Math.min(nodeRadii.length - 1, startIndex + 1);
+  const localProgress = scaledProgress - startIndex;
+  return THREE.MathUtils.lerp(
+    nodeRadii[startIndex],
+    nodeRadii[endIndex],
+    smoothCreatureRadiusTransition(localProgress)
+  );
+}
+
+function normalizeCreatureNodeHeight() {
+  if (creatureViewport.boneNodes.length < 2) {
+    return;
+  }
+
+  const minY = Math.min(...creatureViewport.boneNodes.map((node) => node.y));
+  const offsetY = getCreatureDefaultBottomNodeY() - minY;
+
+  if (Math.abs(offsetY) < 0.001) {
+    return;
+  }
+
+  creatureViewport.boneNodes.forEach((node) => {
+    node.y += offsetY;
+  });
+}
+
+function getCreatureLowestSurfaceY(nodes = creatureViewport.boneNodes, nodeRadii = creatureViewport.nodeBodyRadii) {
+  if (!nodes.length) {
+    return Infinity;
+  }
+
+  return Math.min(...nodes.map((node, index) => (
+    node.y - (nodeRadii[index] || creatureBodyRadius)
+  )));
+}
+
+function creatureNodesFitAboveGround(nodes, nodeRadii = creatureViewport.nodeBodyRadii) {
+  return getCreatureLowestSurfaceY(nodes, nodeRadii) >= creatureGroundLimitY;
+}
+
+function cancelCreatureSettle() {
+  if (creatureViewport.settleTimer) {
+    window.clearTimeout(creatureViewport.settleTimer);
+    creatureViewport.settleTimer = null;
+  }
+
+  if (creatureViewport.settleAnimationId) {
+    window.cancelAnimationFrame(creatureViewport.settleAnimationId);
+    creatureViewport.settleAnimationId = null;
+  }
+}
+
+function scheduleCreatureSettle() {
+  cancelCreatureSettle();
+
+  const minY = Math.min(...creatureViewport.boneNodes.map((node) => node.y));
+  const offsetY = getCreatureDefaultBottomNodeY() - minY;
+  const minZ = Math.min(...creatureViewport.boneNodes.map((node) => node.z));
+  const maxZ = Math.max(...creatureViewport.boneNodes.map((node) => node.z));
+  const centerZ = (minZ + maxZ) / 2;
+  const offsetZ = -centerZ;
+
+  if (Math.abs(offsetY) < 0.001 && Math.abs(offsetZ) < 0.001) {
+    creatureViewport.pendingSettle = false;
+    return;
+  }
+
+  creatureViewport.pendingSettle = true;
+  creatureViewport.settleTimer = window.setTimeout(() => {
+    const startTime = performance.now();
+    const startNodes = creatureViewport.boneNodes.map((node) => node.clone());
+
+    const animate = (timestamp) => {
+      const progress = THREE.MathUtils.clamp((timestamp - startTime) / creatureSettleDurationMs, 0, 1);
+      const easedProgress = 1 - Math.pow(1 - progress, 3);
+
+      creatureViewport.boneNodes.forEach((node, index) => {
+        node.y = startNodes[index].y + (offsetY * easedProgress);
+        node.z = startNodes[index].z + (offsetZ * easedProgress);
+      });
+      rebuildCreatureBody({ preserveHeight: true });
+
+      if (progress < 1) {
+        creatureViewport.settleAnimationId = window.requestAnimationFrame(animate);
+        return;
+      }
+
+      creatureViewport.settleAnimationId = null;
+      creatureViewport.pendingSettle = false;
+      markEditorDirty();
+    };
+
+    creatureViewport.settleTimer = null;
+    creatureViewport.settleAnimationId = window.requestAnimationFrame(animate);
+  }, creatureSettleDelayMs);
+}
+
+function getCreatureBoneCount() {
+  return Math.max(0, creatureViewport.boneNodes.length - 1);
+}
+
+function getCreatureEndNode(direction) {
+  return direction === 'up'
+    ? creatureViewport.boneNodes[creatureViewport.boneNodes.length - 1]
+    : creatureViewport.boneNodes[0];
+}
+
+function setCreatureEndNodeDepth(direction, targetZ) {
+  if (creatureViewport.boneNodes.length < 2) {
+    return;
+  }
+
+  const isUp = direction === 'up';
+  const endIndex = isUp ? creatureViewport.boneNodes.length - 1 : 0;
+  const anchorIndex = isUp ? endIndex - 1 : 1;
+  const endNode = creatureViewport.boneNodes[endIndex];
+  const anchorNode = creatureViewport.boneNodes[anchorIndex];
+  const maxDeltaZ = creatureBoneSpacing * 0.92;
+  let nextZ = THREE.MathUtils.clamp(
+    targetZ,
+    anchorNode.z - maxDeltaZ,
+    anchorNode.z + maxDeltaZ
+  );
+
+  if (state.creatureMagneticMovement) {
+    const maxAngle = Math.asin(maxDeltaZ / creatureBoneSpacing);
+    const angle = THREE.MathUtils.clamp(
+      Math.asin(THREE.MathUtils.clamp((nextZ - anchorNode.z) / creatureBoneSpacing, -1, 1)),
+      -maxAngle,
+      maxAngle
+    );
+    const snappedAngle = Math.round(angle / creatureMagneticAngleStep) * creatureMagneticAngleStep;
+    nextZ = anchorNode.z + (Math.sin(snappedAngle) * creatureBoneSpacing);
+  }
+
+  const deltaZ = nextZ - anchorNode.z;
+  const deltaY = Math.sqrt(Math.max(0.001, (creatureBoneSpacing ** 2) - (deltaZ ** 2)));
+
+  endNode.z = nextZ;
+  endNode.y = anchorNode.y + (isUp ? deltaY : -deltaY);
+}
+
+function updateCreatureMagneticMovementButton() {
+  if (!elements.creatureMagneticMovementButton) {
+    return;
+  }
+
+  elements.creatureMagneticMovementButton.classList.toggle('tool-active', state.creatureMagneticMovement);
+  elements.creatureMagneticMovementButton.setAttribute('aria-pressed', String(state.creatureMagneticMovement));
+}
+
+function updateCreatureLimbPlacementButton() {
+  if (!elements.creatureLimbPlacementButton) {
+    return;
+  }
+
+  elements.creatureLimbPlacementButton.classList.toggle('tool-active', state.creatureLimbPlacement);
+  elements.creatureLimbPlacementButton.setAttribute('aria-pressed', String(state.creatureLimbPlacement));
+}
+
+function toggleCreatureMagneticMovement() {
+  state.creatureMagneticMovement = !state.creatureMagneticMovement;
+  updateCreatureMagneticMovementButton();
+  markEditorDirty();
+}
+
+function toggleCreatureLimbPlacement() {
+  state.creatureLimbPlacement = !state.creatureLimbPlacement;
+  updateCreatureLimbPlacementButton();
+  updateCreatureHandleVisibility();
+  markEditorDirty();
+}
+
+function createCylinderBetweenPoints(startPoint, endPoint, radius, material, radialSegments = 14) {
+  const direction = endPoint.clone().sub(startPoint);
+  const length = direction.length();
+  const mesh = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, Math.max(0.001, length), radialSegments), material);
+
+  mesh.position.copy(startPoint).add(endPoint).multiplyScalar(0.5);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
   return mesh;
 }
 
+function createCreatureSkeletonSegment(startPoint, endPoint, materials) {
+  const bone = createCylinderBetweenPoints(startPoint, endPoint, 0.022, materials.bone, 14);
+  bone.userData.creatureSkeleton = true;
+  return bone;
+}
+
+function getCreatureArrowDirection(nodes, direction) {
+  if (nodes.length < 2) {
+    return new THREE.Vector3(0, direction === 'up' ? 1 : -1, 0);
+  }
+
+  const endIndex = direction === 'up' ? nodes.length - 1 : 0;
+  const anchorIndex = direction === 'up' ? endIndex - 1 : 1;
+  const arrowDirection = nodes[endIndex].clone().sub(nodes[anchorIndex]).normalize();
+
+  if (arrowDirection.lengthSq() < 0.001) {
+    return new THREE.Vector3(0, direction === 'up' ? 1 : -1, 0);
+  }
+
+  return arrowDirection;
+}
+
+function orientCreatureArrow(arrow, direction, arrowDirection) {
+  const sourceDirection = new THREE.Vector3(0, direction === 'up' ? 1 : -1, 0);
+  arrow.quaternion.setFromUnitVectors(sourceDirection, arrowDirection);
+}
+
+function createCreatureArrowHitTarget(startPoint, endPoint, direction) {
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false
+  });
+  const bridge = createCylinderBetweenPoints(startPoint, endPoint, 0.13, material, 16);
+  const endHandle = new THREE.Mesh(new THREE.SphereGeometry(0.16, 18, 12), material);
+
+  bridge.userData.creatureArrowDirection = direction;
+  bridge.userData.creatureArrowHitTarget = true;
+  endHandle.userData.creatureArrowDirection = direction;
+  endHandle.userData.creatureArrowHitTarget = true;
+  endHandle.position.copy(endPoint);
+  bridge.renderOrder = -1;
+  endHandle.renderOrder = -1;
+  return [bridge, endHandle];
+}
+
+function createCreatureBodyScaleHandle(node, radius, nodeIndex) {
+  const group = new THREE.Group();
+  const direction = new THREE.Vector3(-1, 0.25, 0).normalize();
+  const startPoint = node.clone().addScaledVector(direction, radius * 0.78);
+  const endPoint = node.clone().addScaledVector(direction, radius + creatureBodyScaleHandleOffset);
+  const material = new THREE.MeshStandardMaterial({
+    color: 0x10a510,
+    emissive: 0x087508,
+    emissiveIntensity: 0.16,
+    roughness: 0.48,
+    metalness: 0.04
+  });
+  const shaft = createCylinderBetweenPoints(startPoint, endPoint, 0.025, material, 12);
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.105, 0.2, 24), material);
+  const jointMarker = new THREE.Mesh(new THREE.SphereGeometry(0.05, 18, 12), material);
+  const hitMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false
+  });
+  const hitTarget = createCylinderBetweenPoints(startPoint, endPoint, 0.12, hitMaterial, 16);
+
+  head.position.copy(endPoint);
+  head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+  jointMarker.position.copy(node);
+  [shaft, head, jointMarker, hitTarget].forEach((item) => {
+    item.userData.creatureBodyScaleHandle = true;
+    item.userData.creatureBodyNodeIndex = nodeIndex;
+  });
+  hitTarget.userData.creatureBodyScaleHitTarget = true;
+  group.add(shaft, head, jointMarker, hitTarget);
+  group.userData.creatureBodyScaleHandle = true;
+  group.userData.creatureBodyNodeIndex = nodeIndex;
+  return group;
+}
+
+function createCreatureBodyRing(center, tangent, radius) {
+  let xAxis = new THREE.Vector3(1, 0, 0);
+  let zAxis = tangent.clone().cross(xAxis);
+
+  if (zAxis.lengthSq() < 0.0001) {
+    xAxis = new THREE.Vector3(0, 0, 1);
+    zAxis = tangent.clone().cross(xAxis);
+  }
+
+  zAxis.normalize();
+  xAxis.crossVectors(zAxis, tangent).normalize();
+  const vertices = [];
+
+  for (let index = 0; index < creatureBodyRadialSegments; index += 1) {
+    const angle = (index / creatureBodyRadialSegments) * Math.PI * 2;
+    vertices.push(
+      center.clone()
+        .addScaledVector(xAxis, Math.cos(angle) * radius)
+        .addScaledVector(zAxis, Math.sin(angle) * radius)
+    );
+  }
+
+  return vertices;
+}
+
+function createCreatureBodyGeometry(nodes, nodeRadii) {
+  const curve = nodes.length === 2
+    ? new THREE.LineCurve3(nodes[0], nodes[1])
+    : new THREE.CatmullRomCurve3(nodes, false, 'centripetal', 0.35);
+  const bodySegments = Math.max(18, (nodes.length - 1) * 24);
+  const rings = [];
+  const startPoint = curve.getPoint(0);
+  const startTangent = curve.getTangent(0).normalize();
+  const endPoint = curve.getPoint(1);
+  const endTangent = curve.getTangent(1).normalize();
+  const startRadius = getCreatureRadiusAtProgress(nodeRadii, 0);
+  const endRadius = getCreatureRadiusAtProgress(nodeRadii, 1);
+  const startPole = startPoint.clone().addScaledVector(startTangent, -startRadius);
+  const endPole = endPoint.clone().addScaledVector(endTangent, endRadius);
+
+  for (let index = 1; index <= creatureBodyCapSegments; index += 1) {
+    const capProgress = index / creatureBodyCapSegments;
+    const angle = capProgress * Math.PI * 0.5;
+    const center = startPoint.clone().addScaledVector(startTangent, -Math.cos(angle) * startRadius);
+    const radius = Math.sin(angle) * startRadius;
+    rings.push(createCreatureBodyRing(center, startTangent, radius));
+  }
+
+  for (let index = 1; index < bodySegments; index += 1) {
+    const progress = index / bodySegments;
+    rings.push(createCreatureBodyRing(
+      curve.getPoint(progress),
+      curve.getTangent(progress).normalize(),
+      getCreatureRadiusAtProgress(nodeRadii, progress)
+    ));
+  }
+
+  for (let index = 0; index < creatureBodyCapSegments; index += 1) {
+    const capProgress = index / creatureBodyCapSegments;
+    const angle = capProgress * Math.PI * 0.5;
+    const center = endPoint.clone().addScaledVector(endTangent, Math.sin(angle) * endRadius);
+    const radius = Math.cos(angle) * endRadius;
+    rings.push(createCreatureBodyRing(center, endTangent, radius));
+  }
+
+  const positions = [];
+  const indices = [];
+
+  positions.push(startPole.x, startPole.y, startPole.z);
+  rings.forEach((ring) => {
+    ring.forEach((vertex) => {
+      positions.push(vertex.x, vertex.y, vertex.z);
+    });
+  });
+  const endPoleIndex = positions.length / 3;
+  positions.push(endPole.x, endPole.y, endPole.z);
+
+  for (let segmentIndex = 0; segmentIndex < creatureBodyRadialSegments; segmentIndex += 1) {
+    const nextSegmentIndex = (segmentIndex + 1) % creatureBodyRadialSegments;
+    indices.push(
+      0,
+      1 + nextSegmentIndex,
+      1 + segmentIndex
+    );
+  }
+
+  for (let ringIndex = 0; ringIndex < rings.length - 1; ringIndex += 1) {
+    const currentStart = 1 + (ringIndex * creatureBodyRadialSegments);
+    const nextStart = 1 + ((ringIndex + 1) * creatureBodyRadialSegments);
+
+    for (let segmentIndex = 0; segmentIndex < creatureBodyRadialSegments; segmentIndex += 1) {
+      const nextSegmentIndex = (segmentIndex + 1) % creatureBodyRadialSegments;
+      indices.push(
+        currentStart + segmentIndex,
+        currentStart + nextSegmentIndex,
+        nextStart + segmentIndex,
+        currentStart + nextSegmentIndex,
+        nextStart + nextSegmentIndex,
+        nextStart + segmentIndex
+      );
+    }
+  }
+
+  const lastRingStart = 1 + ((rings.length - 1) * creatureBodyRadialSegments);
+  for (let segmentIndex = 0; segmentIndex < creatureBodyRadialSegments; segmentIndex += 1) {
+    const nextSegmentIndex = (segmentIndex + 1) % creatureBodyRadialSegments;
+    indices.push(
+      lastRingStart + segmentIndex,
+      lastRingStart + nextSegmentIndex,
+      endPoleIndex
+    );
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function createCreatureBodyMeshes(nodes, nodeRadii, material) {
+  if (nodes.length < 2) {
+    return [];
+  }
+
+  const body = new THREE.Mesh(createCreatureBodyGeometry(nodes, nodeRadii), material);
+  body.userData.creatureBody = true;
+  return [body];
+}
+
+function createCreatureLimbId() {
+  return `limb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function mirrorCreatureLimbVector(vector) {
+  return new THREE.Vector3(-vector.x, vector.y, vector.z);
+}
+
+function getCreatureLimbById(limbId) {
+  return creatureViewport.limbAnchors.find((limb) => limb.id === limbId) || null;
+}
+
+function ensureCreatureLimbNodes(limb) {
+  if (!Array.isArray(limb.nodes) || !limb.nodes.length) {
+    limb.nodes = [limb.point.clone()];
+  }
+
+  limb.nodes[0].copy(limb.point);
+  if (limb.nodes.length > creatureMaxBones + 1) {
+    limb.nodes.length = creatureMaxBones + 1;
+  }
+}
+
+function getCreatureLimbSideSign(limb) {
+  const sideNode = limb.nodes.find((node) => Math.abs(node.x) > creatureLimbMirrorCenterThreshold)
+    || limb.point;
+
+  if (Math.abs(sideNode.x) <= creatureLimbMirrorCenterThreshold) {
+    return 1;
+  }
+
+  return sideNode.x > 0 ? 1 : -1;
+}
+
+function shouldMirrorCreatureLimb(limb) {
+  return limb.nodes.some((node) => Math.abs(node.x) > creatureLimbMirrorCenterThreshold)
+    || Math.abs(limb.point.x) > creatureLimbMirrorCenterThreshold;
+}
+
+function getCreatureLimbRenderCopies(limb) {
+  ensureCreatureLimbNodes(limb);
+  const copies = [{
+    mirrorSign: 1,
+    nodes: limb.nodes.map((node) => node.clone())
+  }];
+
+  if (shouldMirrorCreatureLimb(limb)) {
+    copies.push({
+      mirrorSign: -1,
+      nodes: limb.nodes.map((node) => mirrorCreatureLimbVector(node))
+    });
+  }
+
+  return copies;
+}
+
+function getCreatureLimbInitialDirection(point, mirrorSign = 1) {
+  const side = Math.abs(point.x) > creatureLimbMirrorCenterThreshold
+    ? Math.sign(point.x)
+    : mirrorSign;
+
+  return new THREE.Vector3(side || 1, 0.12, 0).normalize();
+}
+
+function getCreatureLimbEndDirection(nodes, mirrorSign = 1) {
+  if (nodes.length >= 2) {
+    const direction = nodes[nodes.length - 1].clone().sub(nodes[nodes.length - 2]);
+    if (direction.lengthSq() > 0.0001) {
+      return direction.normalize();
+    }
+  }
+
+  return getCreatureLimbInitialDirection(nodes[0], mirrorSign);
+}
+
+function createCreatureLimbArrowHitTarget(startPoint, endPoint, limbId, mirrorSign) {
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false
+  });
+  const bridge = createCylinderBetweenPoints(startPoint, endPoint, 0.13, material, 16);
+  const endHandle = new THREE.Mesh(new THREE.SphereGeometry(0.16, 18, 12), material);
+
+  [bridge, endHandle].forEach((target) => {
+    target.userData.creatureLimbArrowId = limbId;
+    target.userData.creatureLimbMirrorSign = mirrorSign;
+    target.userData.creatureLimbArrowHitTarget = true;
+    target.renderOrder = -1;
+  });
+  endHandle.position.copy(endPoint);
+  return [bridge, endHandle];
+}
+
+function createCreatureLimbJointHitTarget(point, limbId, mirrorSign) {
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false
+  });
+  const target = new THREE.Mesh(new THREE.SphereGeometry(creatureLimbJointHitRadius, 18, 12), material);
+
+  target.position.copy(point);
+  target.userData.creatureLimbAnchorId = limbId;
+  target.userData.creatureLimbMirrorSign = mirrorSign;
+  target.userData.creatureLimbAnchorHitTarget = true;
+  target.renderOrder = -1;
+  return target;
+}
+
+function createCreatureLimbSurfaceSkin(nodes, material) {
+  if (nodes.length < 2) {
+    return [];
+  }
+
+  const radii = nodes.map((_, index) => (
+    index === 0 ? creatureLimbBodyRadius * 0.82 : creatureLimbBodyRadius
+  ));
+
+  return createCreatureBodyMeshes(nodes, radii, material).map((mesh) => {
+    mesh.userData.creatureLimbBody = true;
+    return mesh;
+  });
+}
+
+function renderCreatureLimbCopy(limb, nodes, mirrorSign, materials) {
+  const controlsGroup = creatureViewport.limbControlsGroup;
+  const endPoint = nodes[nodes.length - 1];
+  const arrowDirection = getCreatureLimbEndDirection(nodes, mirrorSign);
+  const arrow = createCreatureLimb('up');
+  const arrowEnd = endPoint.clone().addScaledVector(arrowDirection, creatureLimbArrowOffset);
+
+  createCreatureLimbSurfaceSkin(nodes, materials.body).forEach((mesh) => {
+    creatureViewport.bodyGroup.add(mesh);
+    creatureViewport.bodyMeshes.push(mesh);
+  });
+
+  for (let index = 0; index < nodes.length - 1; index += 1) {
+    controlsGroup.add(createCreatureSkeletonSegment(nodes[index], nodes[index + 1], {
+      bone: materials.bone,
+      joint: materials.joint
+    }));
+  }
+
+  nodes.forEach((node, index) => {
+    const isAnchor = index === 0;
+    const joint = new THREE.Mesh(
+      new THREE.SphereGeometry(isAnchor ? creatureEndJointVisualRadius : creatureInnerJointVisualRadius, 18, 12),
+      materials.joint
+    );
+
+    joint.position.copy(node);
+    joint.userData.creatureLimbAnchorId = limb.id;
+    joint.userData.creatureLimbMirrorSign = mirrorSign;
+    joint.userData.creatureLimbJoint = true;
+    controlsGroup.add(joint);
+
+    if (isAnchor) {
+      const hitTarget = createCreatureLimbJointHitTarget(node, limb.id, mirrorSign);
+      controlsGroup.add(hitTarget);
+      creatureViewport.limbJointTargets.push(joint, hitTarget);
+    }
+  });
+
+  arrow.position.copy(arrowEnd);
+  orientCreatureArrow(arrow, 'up', arrowDirection);
+  arrow.userData.creatureLimbArrowId = limb.id;
+  arrow.userData.creatureLimbMirrorSign = mirrorSign;
+  arrow.traverse((child) => {
+    child.userData.creatureLimbArrowId = limb.id;
+    child.userData.creatureLimbMirrorSign = mirrorSign;
+  });
+  controlsGroup.add(arrow);
+  creatureViewport.limbArrowTargets.push(arrow);
+
+  createCreatureLimbArrowHitTarget(endPoint, arrowEnd, limb.id, mirrorSign).forEach((target) => {
+    controlsGroup.add(target);
+    creatureViewport.limbArrowTargets.push(target);
+  });
+}
+
+function renderCreatureLimbs(materials) {
+  const controlsGroup = new THREE.Group();
+  creatureViewport.limbControlsGroup = controlsGroup;
+
+  creatureViewport.limbAnchors.forEach((limb) => {
+    getCreatureLimbRenderCopies(limb).forEach((copy) => {
+      renderCreatureLimbCopy(limb, copy.nodes, copy.mirrorSign, materials);
+    });
+  });
+
+  creatureViewport.bodyGroup.add(controlsGroup);
+}
+
 function updateCreatureHandleVisibility() {
-  const shouldShow = creatureViewport.hoveredCreature || Boolean(creatureViewport.arrowDrag);
+  const shouldShow = creatureViewport.hoveredCreature
+    || Boolean(creatureViewport.arrowDrag)
+    || Boolean(creatureViewport.limbAnchorDrag)
+    || Boolean(creatureViewport.limbArrowDrag);
+  const shouldShowLimbControls = shouldShow
+    || state.creatureLimbPlacement
+    || Boolean(creatureViewport.selectedLimbAnchorId);
 
   if (creatureViewport.skeletonGroup) {
     creatureViewport.skeletonGroup.visible = shouldShow;
   }
 
+  if (creatureViewport.limbControlsGroup) {
+    creatureViewport.limbControlsGroup.visible = shouldShowLimbControls;
+  }
+
   creatureViewport.bodyMeshes.forEach((mesh) => {
     if (mesh.material) {
-      mesh.material.opacity = shouldShow ? 0.58 : 0.9;
+      const shouldBeTransparent = shouldShow;
+      if (mesh.material.transparent !== shouldBeTransparent) {
+        mesh.material.transparent = shouldBeTransparent;
+        mesh.material.needsUpdate = true;
+      }
+      mesh.material.opacity = shouldShow ? 0.62 : 1;
     }
   });
 
   creatureViewport.arrowTargets.forEach((arrow) => {
+    const direction = arrow.userData.creatureArrowDirection;
+    const isLimit = getCreatureBoneCount() >= creatureMaxBones;
     const isHovered = arrow.userData.creatureArrowDirection === creatureViewport.hoveredArrowDirection;
     arrow.visible = shouldShow || isHovered;
+    if (arrow.userData.creatureArrowHitTarget) {
+      arrow.traverse((child) => {
+        if (child.material) {
+          child.material.opacity = 0;
+          child.material.transparent = true;
+          child.material.depthWrite = false;
+        }
+      });
+      return;
+    }
+
     arrow.traverse((child) => {
       if (child.material) {
-        child.material.opacity = isHovered ? 1 : 0.72;
+        child.material.opacity = isLimit && direction === creatureViewport.hoveredArrowDirection ? 0.72 : (isHovered ? 1 : 0.72);
         child.material.transparent = true;
       }
     });
   });
+
+  creatureViewport.bodyScaleTargets.forEach((target) => {
+    target.visible = creatureViewport.selectedBodyNodeIndex !== null;
+    if (target.userData.creatureBodyScaleHitTarget) {
+      target.traverse((child) => {
+        if (child.material) {
+          child.material.opacity = 0;
+          child.material.transparent = true;
+          child.material.depthWrite = false;
+        }
+      });
+    }
+  });
+
+  creatureViewport.limbArrowTargets.forEach((target) => {
+    const isHovered = target.userData.creatureLimbArrowId === creatureViewport.hoveredLimbArrowId;
+
+    if (target.userData.creatureLimbArrowHitTarget) {
+      target.traverse((child) => {
+        if (child.material) {
+          child.material.opacity = 0;
+          child.material.transparent = true;
+          child.material.depthWrite = false;
+        }
+      });
+      return;
+    }
+
+    target.traverse((child) => {
+      if (child.material) {
+        child.material.opacity = isHovered ? 1 : 0.78;
+        child.material.transparent = true;
+      }
+    });
+  });
+
+  creatureViewport.limbJointTargets.forEach((target) => {
+    if (target.userData.creatureLimbAnchorHitTarget) {
+      target.traverse((child) => {
+        if (child.material) {
+          child.material.opacity = 0;
+          child.material.transparent = true;
+          child.material.depthWrite = false;
+        }
+      });
+    }
+  });
 }
 
-function rebuildCreatureBody() {
+function rebuildCreatureBody(options = {}) {
   if (!creatureViewport.bodyGroup) {
     return;
   }
 
+  disposeObjectTree(creatureViewport.bodyGroup);
   creatureViewport.bodyGroup.clear();
   creatureViewport.bodyMeshes = [];
+  creatureViewport.bodySurfaceTargets = [];
   creatureViewport.arrowTargets = [];
+  creatureViewport.jointTargets = [];
+  creatureViewport.bodyScaleTargets = [];
+  creatureViewport.limbControlsGroup = null;
+  creatureViewport.limbJointTargets = [];
+  creatureViewport.limbArrowTargets = [];
+  if (creatureViewport.boneNodes.length < 2) {
+    creatureViewport.boneNodes = createInitialCreatureNodes();
+  }
+  ensureCreatureNodeBodyRadii();
+  if (
+    creatureViewport.selectedBodyNodeIndex !== null
+    && creatureViewport.selectedBodyNodeIndex >= creatureViewport.boneNodes.length
+  ) {
+    creatureViewport.selectedBodyNodeIndex = null;
+  }
+  if (!options.preserveHeight) {
+    normalizeCreatureNodeHeight();
+  }
 
   const bodyMaterial = new THREE.MeshStandardMaterial({
     color: 0x7fd6c5,
     roughness: 0.74,
     metalness: 0.04,
-    transparent: true,
-    opacity: 0.9
+    transparent: false,
+    opacity: 1
   });
   const boneMaterial = new THREE.MeshStandardMaterial({
     color: 0x1a4dff,
@@ -10356,54 +11526,95 @@ function rebuildCreatureBody() {
   });
 
   const skeletonGroup = new THREE.Group();
-  const sortedOffsets = [...creatureViewport.boneOffsets].sort((a, b) => a - b);
-  const bodyMesh = createCreatureBodyMesh(sortedOffsets, bodyMaterial);
-  creatureViewport.bodyGroup.add(bodyMesh);
-  creatureViewport.bodyMeshes.push(bodyMesh);
+  const nodes = creatureViewport.boneNodes.map((node) => node.clone());
+  const nodeRadii = [...creatureViewport.nodeBodyRadii];
+  const bodyMeshes = createCreatureBodyMeshes(nodes, nodeRadii, bodyMaterial);
+  bodyMeshes.forEach((mesh) => {
+    creatureViewport.bodyGroup.add(mesh);
+    creatureViewport.bodyMeshes.push(mesh);
+    creatureViewport.bodySurfaceTargets.push(mesh);
+  });
 
-  sortedOffsets.forEach((offset) => {
-    const segment = createCreatureSkeletonSegment(offset, {
+  for (let index = 0; index < nodes.length - 1; index += 1) {
+    const segment = createCreatureSkeletonSegment(nodes[index], nodes[index + 1], {
       bone: boneMaterial,
       joint: jointMaterial
     });
     skeletonGroup.add(segment);
-  });
-
-  const connectorMaterial = new THREE.MeshStandardMaterial({
-    color: 0x244bd8,
-    emissive: 0x1434a8,
-    emissiveIntensity: 0.1,
-    roughness: 0.4
-  });
-
-  for (let index = 1; index < sortedOffsets.length; index += 1) {
-    const previous = sortedOffsets[index - 1];
-    const current = sortedOffsets[index];
-    if (current - previous !== 1) {
-      continue;
-    }
-
-    const connectorHeight = Math.max(0.08, creatureBoneSpacing - creatureBoneLength);
-    const connector = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.025, 0.025, connectorHeight, 10),
-      connectorMaterial
-    );
-    connector.position.y = creatureBaseHeight + ((previous + current) * 0.5 * creatureBoneSpacing);
-    connector.userData.creatureSkeleton = true;
-    skeletonGroup.add(connector);
   }
+
+  nodes.forEach((node, nodeIndex) => {
+    const isEndJoint = nodeIndex === 0 || nodeIndex === nodes.length - 1;
+    const joint = new THREE.Mesh(
+      new THREE.SphereGeometry(isEndJoint ? creatureEndJointVisualRadius : creatureInnerJointVisualRadius, 18, 12),
+      jointMaterial
+    );
+    const jointHitTarget = new THREE.Mesh(
+      new THREE.SphereGeometry(creatureJointHitRadius, 18, 12),
+      new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false
+      })
+    );
+
+    joint.position.copy(node);
+    jointHitTarget.position.copy(node);
+    joint.userData.creatureSkeleton = true;
+    joint.userData.creatureJointIndex = nodeIndex;
+    jointHitTarget.userData.creatureJointIndex = nodeIndex;
+    jointHitTarget.userData.creatureJointHitTarget = true;
+    skeletonGroup.add(joint);
+    skeletonGroup.add(jointHitTarget);
+    creatureViewport.jointTargets.push(joint, jointHitTarget);
+  });
 
   creatureViewport.skeletonGroup = skeletonGroup;
   creatureViewport.bodyGroup.add(skeletonGroup);
 
-  const minOffset = Math.min(...sortedOffsets);
-  const maxOffset = Math.max(...sortedOffsets);
   const upArrow = createCreatureLimb('up');
   const downArrow = createCreatureLimb('down');
-  upArrow.position.y = creatureBaseHeight + (maxOffset * creatureBoneSpacing) + 0.88;
-  downArrow.position.y = creatureBaseHeight + (minOffset * creatureBoneSpacing) - 0.88;
+  const topNode = nodes[nodes.length - 1];
+  const bottomNode = nodes[0];
+  const upArrowDirection = getCreatureArrowDirection(nodes, 'up');
+  const downArrowDirection = getCreatureArrowDirection(nodes, 'down');
+  upArrow.position.copy(topNode).addScaledVector(upArrowDirection, creatureArrowOffset);
+  downArrow.position.copy(bottomNode).addScaledVector(downArrowDirection, creatureArrowOffset);
+  orientCreatureArrow(upArrow, 'up', upArrowDirection);
+  orientCreatureArrow(downArrow, 'down', downArrowDirection);
   creatureViewport.bodyGroup.add(upArrow, downArrow);
   creatureViewport.arrowTargets.push(upArrow, downArrow);
+  createCreatureArrowHitTarget(topNode, upArrow.position, 'up').forEach((target) => {
+    creatureViewport.bodyGroup.add(target);
+    creatureViewport.arrowTargets.push(target);
+  });
+  createCreatureArrowHitTarget(bottomNode, downArrow.position, 'down').forEach((target) => {
+    creatureViewport.bodyGroup.add(target);
+    creatureViewport.arrowTargets.push(target);
+  });
+
+  if (creatureViewport.selectedBodyNodeIndex !== null) {
+    const selectedNode = nodes[creatureViewport.selectedBodyNodeIndex];
+    const selectedRadius = nodeRadii[creatureViewport.selectedBodyNodeIndex] || creatureBodyRadius;
+    const scaleHandle = createCreatureBodyScaleHandle(
+      selectedNode,
+      selectedRadius,
+      creatureViewport.selectedBodyNodeIndex
+    );
+    creatureViewport.bodyGroup.add(scaleHandle);
+    scaleHandle.traverse((child) => {
+      if (child.userData.creatureBodyScaleHandle) {
+        creatureViewport.bodyScaleTargets.push(child);
+      }
+    });
+  }
+
+  renderCreatureLimbs({
+    body: bodyMaterial,
+    bone: boneMaterial,
+    joint: jointMaterial
+  });
 
   updateCreatureHandleVisibility();
 }
@@ -10415,52 +11626,409 @@ function updateCreatureRayFromPointerEvent(event) {
   creatureViewport.raycaster.setFromCamera(creatureViewport.pointer, creatureViewport.camera);
 }
 
+function getCreaturePlanePointFromPointerEvent(event) {
+  updateCreatureRayFromPointerEvent(event);
+  return creatureViewport.raycaster.ray.intersectPlane(
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
+    new THREE.Vector3()
+  );
+}
+
 function getCreatureArrowIntersection(event) {
   updateCreatureRayFromPointerEvent(event);
   const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.arrowTargets, true);
   return intersections.find((intersection) => intersection.object.userData?.creatureArrowDirection) || null;
 }
 
+function getCreatureBodyScaleIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyScaleTargets, true);
+  return intersections.find((intersection) => intersection.object.userData?.creatureBodyScaleHandle) || null;
+}
+
+function getCreatureJointIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.jointTargets, true);
+  return intersections.find((intersection) => Number.isInteger(intersection.object.userData?.creatureJointIndex)) || null;
+}
+
+function getCreatureBodySurfaceIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  return creatureViewport.raycaster.intersectObjects(creatureViewport.bodySurfaceTargets, false)[0] || null;
+}
+
+function getCreatureLimbJointIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.limbJointTargets, true);
+  return intersections.find((intersection) => intersection.object.userData?.creatureLimbAnchorId) || null;
+}
+
+function getCreatureLimbArrowIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.limbArrowTargets, true);
+  return intersections.find((intersection) => intersection.object.userData?.creatureLimbArrowId) || null;
+}
+
+function getCreaturePointerPointOnCameraPlane(event, point) {
+  updateCreatureRayFromPointerEvent(event);
+  const normal = new THREE.Vector3();
+  creatureViewport.camera.getWorldDirection(normal);
+  return creatureViewport.raycaster.ray.intersectPlane(
+    new THREE.Plane().setFromNormalAndCoplanarPoint(normal, point),
+    new THREE.Vector3()
+  );
+}
+
+function getCanonicalCreatureLimbPoint(point, mirrorSign = 1) {
+  const canonicalPoint = mirrorSign === -1 ? mirrorCreatureLimbVector(point) : point.clone();
+
+  if (Math.abs(canonicalPoint.x) < creatureLimbMirrorCenterThreshold) {
+    canonicalPoint.x = 0;
+  }
+
+  return canonicalPoint;
+}
+
+function clampCreatureLimbTarget(limb, target) {
+  const clampedTarget = target.clone();
+  const isSideAnchor = Math.abs(limb.point.x) > creatureLimbMirrorCenterThreshold;
+
+  if (isSideAnchor && Math.sign(clampedTarget.x || limb.point.x) !== Math.sign(limb.point.x)) {
+    clampedTarget.x = 0;
+  }
+
+  if (Math.abs(clampedTarget.x) < creatureLimbMirrorCenterThreshold) {
+    clampedTarget.x = 0;
+  }
+
+  clampedTarget.x = THREE.MathUtils.clamp(clampedTarget.x, -1.75, 1.75);
+  clampedTarget.y = THREE.MathUtils.clamp(
+    clampedTarget.y,
+    creatureGroundLimitY + creatureLimbBodyRadius,
+    creatureBaseHeight + 2.3
+  );
+  clampedTarget.z = THREE.MathUtils.clamp(clampedTarget.z, -1.85, 1.85);
+  return clampedTarget;
+}
+
+function updateCreatureLimbChainFromTarget(limb, target) {
+  ensureCreatureLimbNodes(limb);
+  const nodes = limb.nodes;
+  const segmentCount = nodes.length - 1;
+
+  if (segmentCount <= 0) {
+    const direction = target.clone().sub(nodes[0]);
+
+    if (direction.length() > creatureBoneSpacing * 0.55) {
+      nodes.push(nodes[0].clone().addScaledVector(direction.normalize(), creatureBoneSpacing));
+    }
+
+    return;
+  }
+
+  const previousNode = nodes[nodes.length - 2];
+  const towardTarget = target.clone().sub(previousNode);
+  const distance = towardTarget.length();
+
+  if (distance < creatureBoneSpacing * 0.34) {
+    nodes.pop();
+    return;
+  }
+
+  const direction = distance > 0.001
+    ? towardTarget.normalize()
+    : getCreatureLimbEndDirection(nodes, getCreatureLimbSideSign(limb));
+
+  nodes[nodes.length - 1].copy(previousNode).addScaledVector(direction, creatureBoneSpacing);
+
+  if (distance > creatureBoneSpacing * 1.48 && segmentCount < creatureMaxBones) {
+    nodes.push(nodes[nodes.length - 1].clone().addScaledVector(direction, creatureBoneSpacing));
+  }
+}
+
+function addCreatureLimbAnchor(surfacePoint) {
+  const point = getCanonicalCreatureLimbPoint(surfacePoint);
+  const limb = {
+    id: createCreatureLimbId(),
+    point,
+    nodes: [point.clone()]
+  };
+
+  creatureViewport.limbAnchors.push(limb);
+  creatureViewport.selectedLimbAnchorId = limb.id;
+  creatureViewport.selectedBodyNodeIndex = null;
+  rebuildCreatureBody({ preserveHeight: true });
+  markEditorDirty();
+  return limb;
+}
+
+function removeCreatureLimbAnchor(limbId) {
+  const nextAnchors = creatureViewport.limbAnchors.filter((limb) => limb.id !== limbId);
+
+  if (nextAnchors.length === creatureViewport.limbAnchors.length) {
+    return false;
+  }
+
+  creatureViewport.limbAnchors = nextAnchors;
+  if (creatureViewport.selectedLimbAnchorId === limbId) {
+    creatureViewport.selectedLimbAnchorId = null;
+  }
+  rebuildCreatureBody({ preserveHeight: true });
+  markEditorDirty();
+  return true;
+}
+
+function moveCreatureLimbAnchor(limb, nextPoint) {
+  ensureCreatureLimbNodes(limb);
+  const delta = nextPoint.clone().sub(limb.point);
+
+  limb.point.copy(nextPoint);
+  limb.nodes.forEach((node) => {
+    node.add(delta);
+  });
+  limb.nodes[0].copy(limb.point);
+}
+
 function updateCreatureHover(event) {
-  if (!creatureViewport.initialized || creatureViewport.arrowDrag) {
+  if (
+    !creatureViewport.initialized
+    || creatureViewport.arrowDrag
+    || creatureViewport.bodyScaleDrag
+    || creatureViewport.limbAnchorDrag
+    || creatureViewport.limbArrowDrag
+  ) {
     return;
   }
 
   updateCreatureRayFromPointerEvent(event);
+  const limbArrowIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.limbArrowTargets, true)
+    .find((intersection) => intersection.object.userData?.creatureLimbArrowId);
+  const limbJointIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.limbJointTargets, true)
+    .find((intersection) => intersection.object.userData?.creatureLimbAnchorId);
   const arrowIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.arrowTargets, true)
     .find((intersection) => intersection.object.userData?.creatureArrowDirection);
+  const scaleIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyScaleTargets, true)
+    .find((intersection) => intersection.object.userData?.creatureBodyScaleHandle);
+  const jointIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.jointTargets, true)
+    .find((intersection) => Number.isInteger(intersection.object.userData?.creatureJointIndex));
   const bodyIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyMeshes, false)[0];
 
   creatureViewport.hoveredArrowDirection = arrowIntersection?.object.userData.creatureArrowDirection || null;
-  creatureViewport.hoveredCreature = Boolean(arrowIntersection || bodyIntersection);
-  elements.creatureViewport.style.cursor = arrowIntersection ? 'ns-resize' : (bodyIntersection ? 'grab' : 'grab');
+  creatureViewport.hoveredLimbArrowId = limbArrowIntersection?.object.userData.creatureLimbArrowId || null;
+  creatureViewport.hoveredCreature = Boolean(
+    limbArrowIntersection
+    || limbJointIntersection
+    || arrowIntersection
+    || scaleIntersection
+    || jointIntersection
+    || bodyIntersection
+  );
+  elements.creatureViewport.style.cursor = scaleIntersection
+    ? 'ew-resize'
+    : (
+      limbJointIntersection || jointIntersection
+        ? 'pointer'
+        : (limbArrowIntersection || arrowIntersection ? 'grab' : (state.creatureLimbPlacement && bodyIntersection ? 'crosshair' : 'grab'))
+    );
   updateCreatureHandleVisibility();
 }
 
 function beginCreatureArrowDrag(event) {
+  const limbArrowIntersection = getCreatureLimbArrowIntersection(event);
+  const limbArrowId = limbArrowIntersection?.object.userData?.creatureLimbArrowId;
+
+  if (limbArrowId) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    cancelCreatureSettle();
+    creatureViewport.selectedLimbAnchorId = limbArrowId;
+    creatureViewport.selectedBodyNodeIndex = null;
+    creatureViewport.limbArrowDrag = {
+      pointerId: event.pointerId,
+      limbId: limbArrowId,
+      mirrorSign: limbArrowIntersection.object.userData.creatureLimbMirrorSign === -1 ? -1 : 1
+    };
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = false;
+    }
+    elements.creatureViewport.style.cursor = 'grabbing';
+    elements.creatureViewport.setPointerCapture(event.pointerId);
+    updateCreatureHandleVisibility();
+    return true;
+  }
+
+  const limbJointIntersection = getCreatureLimbJointIntersection(event);
+  const limbAnchorId = limbJointIntersection?.object.userData?.creatureLimbAnchorId;
+
+  if (limbAnchorId) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    if (event.detail >= 2 || event.altKey || event.shiftKey) {
+      removeCreatureLimbAnchor(limbAnchorId);
+      return true;
+    }
+
+    creatureViewport.selectedLimbAnchorId = limbAnchorId;
+    creatureViewport.selectedBodyNodeIndex = null;
+    creatureViewport.limbAnchorDrag = {
+      pointerId: event.pointerId,
+      limbId: limbAnchorId,
+      mirrorSign: limbJointIntersection.object.userData.creatureLimbMirrorSign === -1 ? -1 : 1
+    };
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = false;
+    }
+    elements.creatureViewport.style.cursor = 'grabbing';
+    elements.creatureViewport.setPointerCapture(event.pointerId);
+    updateCreatureHandleVisibility();
+    return true;
+  }
+
+  const scaleIntersection = getCreatureBodyScaleIntersection(event);
+  const scaleNodeIndex = scaleIntersection?.object.userData?.creatureBodyNodeIndex;
+
+  if (Number.isInteger(scaleNodeIndex)) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    cancelCreatureSettle();
+    ensureCreatureNodeBodyRadii();
+    creatureViewport.bodyScaleDrag = {
+      pointerId: event.pointerId,
+      nodeIndex: scaleNodeIndex,
+      startClientX: event.clientX,
+      startRadius: creatureViewport.nodeBodyRadii[scaleNodeIndex] || creatureBodyRadius
+    };
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = false;
+    }
+    elements.creatureViewport.style.cursor = 'ew-resize';
+    elements.creatureViewport.setPointerCapture(event.pointerId);
+    return true;
+  }
+
+  const jointIntersection = getCreatureJointIntersection(event);
+  const jointIndex = jointIntersection?.object.userData?.creatureJointIndex;
+
+  if (Number.isInteger(jointIndex)) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    creatureViewport.selectedBodyNodeIndex = jointIndex;
+    creatureViewport.selectedLimbAnchorId = null;
+    rebuildCreatureBody({ preserveHeight: true });
+    return true;
+  }
+
+  const bodySurfaceIntersection = getCreatureBodySurfaceIntersection(event);
+
+  if (state.creatureLimbPlacement && bodySurfaceIntersection) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    addCreatureLimbAnchor(bodySurfaceIntersection.point);
+    return true;
+  }
+
   const intersection = getCreatureArrowIntersection(event);
   const direction = intersection?.object.userData?.creatureArrowDirection;
+  const planePoint = getCreaturePlanePointFromPointerEvent(event);
 
-  if (!direction) {
+  if (!direction || !planePoint) {
+    const bodyIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyMeshes, false)[0];
+
+    if (!bodyIntersection && (creatureViewport.selectedBodyNodeIndex !== null || creatureViewport.selectedLimbAnchorId !== null)) {
+      creatureViewport.selectedBodyNodeIndex = null;
+      creatureViewport.selectedLimbAnchorId = null;
+      rebuildCreatureBody({ preserveHeight: true });
+    }
+
     return false;
   }
 
+  const endNode = getCreatureEndNode(direction);
   event.preventDefault();
   event.stopImmediatePropagation();
+  cancelCreatureSettle();
   creatureViewport.arrowDrag = {
     pointerId: event.pointerId,
     direction,
-    startClientY: event.clientY
+    startPoint: planePoint.clone(),
+    zPointerOffset: endNode.z - planePoint.z,
+    settleAfterRelease: false
   };
   if (creatureViewport.controls) {
     creatureViewport.controls.enabled = false;
   }
+  elements.creatureViewport.style.cursor = 'grabbing';
   elements.creatureViewport.setPointerCapture(event.pointerId);
   updateCreatureHandleVisibility();
   return true;
 }
 
 function updateCreatureArrowDrag(event) {
+  const limbAnchorDrag = creatureViewport.limbAnchorDrag;
+
+  if (limbAnchorDrag && limbAnchorDrag.pointerId === event.pointerId) {
+    event.preventDefault();
+    const limb = getCreatureLimbById(limbAnchorDrag.limbId);
+    const surfaceIntersection = getCreatureBodySurfaceIntersection(event);
+
+    if (limb && surfaceIntersection) {
+      moveCreatureLimbAnchor(
+        limb,
+        getCanonicalCreatureLimbPoint(surfaceIntersection.point, limbAnchorDrag.mirrorSign)
+      );
+      rebuildCreatureBody({ preserveHeight: true });
+    }
+    return;
+  }
+
+  const limbArrowDrag = creatureViewport.limbArrowDrag;
+
+  if (limbArrowDrag && limbArrowDrag.pointerId === event.pointerId) {
+    event.preventDefault();
+    const limb = getCreatureLimbById(limbArrowDrag.limbId);
+
+    if (!limb) {
+      return;
+    }
+
+    ensureCreatureLimbNodes(limb);
+    const endPoint = limb.nodes[limb.nodes.length - 1];
+    const renderedEndPoint = limbArrowDrag.mirrorSign === -1
+      ? mirrorCreatureLimbVector(endPoint)
+      : endPoint.clone();
+    const planePoint = getCreaturePointerPointOnCameraPlane(event, renderedEndPoint);
+
+    if (!planePoint) {
+      return;
+    }
+
+    const target = clampCreatureLimbTarget(
+      limb,
+      getCanonicalCreatureLimbPoint(planePoint, limbArrowDrag.mirrorSign)
+    );
+    updateCreatureLimbChainFromTarget(limb, target);
+    rebuildCreatureBody({ preserveHeight: true });
+    return;
+  }
+
+  const scaleDrag = creatureViewport.bodyScaleDrag;
+
+  if (scaleDrag && scaleDrag.pointerId === event.pointerId) {
+    event.preventDefault();
+    ensureCreatureNodeBodyRadii();
+    const radiusDelta = -(event.clientX - scaleDrag.startClientX) / 240;
+    const node = creatureViewport.boneNodes[scaleDrag.nodeIndex];
+    const groundLimitedMaxRadius = node ? Math.max(creatureBodyMinRadius, node.y - creatureGroundLimitY) : creatureBodyMaxRadius;
+    creatureViewport.nodeBodyRadii[scaleDrag.nodeIndex] = THREE.MathUtils.clamp(
+      scaleDrag.startRadius + radiusDelta,
+      creatureBodyMinRadius,
+      Math.min(creatureBodyMaxRadius, groundLimitedMaxRadius)
+    );
+    rebuildCreatureBody({ preserveHeight: true });
+    return;
+  }
+
   const drag = creatureViewport.arrowDrag;
 
   if (!drag || drag.pointerId !== event.pointerId) {
@@ -10468,48 +12036,144 @@ function updateCreatureArrowDrag(event) {
   }
 
   event.preventDefault();
-  const deltaY = event.clientY - drag.startClientY;
-  const passedThreshold = Math.abs(deltaY) > 34;
+  const planePoint = getCreaturePlanePointFromPointerEvent(event);
 
-  if (!passedThreshold) {
+  if (!planePoint) {
     return;
   }
 
-  const isExpanding = drag.direction === 'up' ? deltaY < 0 : deltaY > 0;
+  const targetZ = THREE.MathUtils.clamp(planePoint.z + drag.zPointerOffset, -creatureDepthLimit, creatureDepthLimit);
+  setCreatureEndNodeDepth(drag.direction, targetZ);
+  const endNode = getCreatureEndNode(drag.direction);
 
-  if (isExpanding) {
-    if (creatureViewport.boneOffsets.length >= creatureMaxBones) {
-      drag.startClientY = event.clientY;
-      return;
-    }
+  const deltaY = planePoint.y - drag.startPoint.y;
+  const passedThreshold = Math.abs(deltaY) > creatureBoneSpacing * 0.54;
 
-    const nextOffset = drag.direction === 'up'
-      ? Math.max(...creatureViewport.boneOffsets) + 1
-      : Math.min(...creatureViewport.boneOffsets) - 1;
-    creatureViewport.boneOffsets.push(nextOffset);
-  } else {
-    if (creatureViewport.boneOffsets.length <= 1) {
-      drag.startClientY = event.clientY;
-      return;
-    }
-
-    const removedOffset = drag.direction === 'up'
-      ? Math.max(...creatureViewport.boneOffsets)
-      : Math.min(...creatureViewport.boneOffsets);
-    creatureViewport.boneOffsets = creatureViewport.boneOffsets.filter((offset) => offset !== removedOffset);
+  if (!passedThreshold) {
+    rebuildCreatureBody({ preserveHeight: true });
+    return;
   }
 
-  drag.startClientY = event.clientY;
-  rebuildCreatureBody();
+  const isExpanding = drag.direction === 'up' ? deltaY > 0 : deltaY < 0;
+
+  if (isExpanding) {
+    if (getCreatureBoneCount() >= creatureMaxBones) {
+      drag.startPoint.copy(planePoint);
+      rebuildCreatureBody({ preserveHeight: true });
+      return;
+    }
+
+    const nextNode = endNode.clone();
+    nextNode.y += drag.direction === 'up' ? creatureBoneSpacing : -creatureBoneSpacing;
+    nextNode.z = endNode.z;
+    const nextNodes = drag.direction === 'up'
+      ? [...creatureViewport.boneNodes, nextNode]
+      : [nextNode, ...creatureViewport.boneNodes];
+    const endIndex = drag.direction === 'up' ? creatureViewport.nodeBodyRadii.length - 1 : 0;
+    const copiedRadius = creatureViewport.nodeBodyRadii[endIndex] || creatureBodyRadius;
+    const nextRadii = drag.direction === 'up'
+      ? [...creatureViewport.nodeBodyRadii, copiedRadius]
+      : [copiedRadius, ...creatureViewport.nodeBodyRadii];
+
+    if (!creatureNodesFitAboveGround(nextNodes, nextRadii)) {
+      drag.startPoint.copy(planePoint);
+      rebuildCreatureBody({ preserveHeight: true });
+      return;
+    }
+
+    if (drag.direction === 'up') {
+      creatureViewport.boneNodes.push(nextNode);
+      creatureViewport.nodeBodyRadii.push(copiedRadius);
+    } else {
+      creatureViewport.boneNodes.unshift(nextNode);
+      creatureViewport.nodeBodyRadii.unshift(copiedRadius);
+      if (creatureViewport.selectedBodyNodeIndex !== null) {
+        creatureViewport.selectedBodyNodeIndex += 1;
+      }
+    }
+  } else {
+    if (getCreatureBoneCount() <= 1) {
+      drag.startPoint.copy(planePoint);
+      rebuildCreatureBody({ preserveHeight: true });
+      return;
+    }
+
+    if (drag.direction === 'up') {
+      creatureViewport.boneNodes.pop();
+      creatureViewport.nodeBodyRadii.pop();
+      if (creatureViewport.selectedBodyNodeIndex === creatureViewport.boneNodes.length) {
+        creatureViewport.selectedBodyNodeIndex = null;
+      }
+    } else {
+      creatureViewport.boneNodes.shift();
+      creatureViewport.nodeBodyRadii.shift();
+      if (creatureViewport.selectedBodyNodeIndex !== null) {
+        creatureViewport.selectedBodyNodeIndex = Math.max(0, creatureViewport.selectedBodyNodeIndex - 1);
+      }
+    }
+
+    drag.settleAfterRelease = true;
+    creatureViewport.pendingSettle = true;
+    setCreatureEndNodeDepth(drag.direction, targetZ);
+  }
+
+  drag.startPoint.copy(planePoint);
+  rebuildCreatureBody({ preserveHeight: true });
 }
 
 function endCreatureArrowDrag(event) {
+  const limbAnchorDrag = creatureViewport.limbAnchorDrag;
+
+  if (limbAnchorDrag && limbAnchorDrag.pointerId === event.pointerId) {
+    creatureViewport.limbAnchorDrag = null;
+    if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
+      elements.creatureViewport.releasePointerCapture(event.pointerId);
+    }
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = true;
+    }
+    markEditorDirty();
+    updateCreatureHover(event);
+    return;
+  }
+
+  const limbArrowDrag = creatureViewport.limbArrowDrag;
+
+  if (limbArrowDrag && limbArrowDrag.pointerId === event.pointerId) {
+    creatureViewport.limbArrowDrag = null;
+    if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
+      elements.creatureViewport.releasePointerCapture(event.pointerId);
+    }
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = true;
+    }
+    markEditorDirty();
+    updateCreatureHover(event);
+    return;
+  }
+
+  const scaleDrag = creatureViewport.bodyScaleDrag;
+
+  if (scaleDrag && scaleDrag.pointerId === event.pointerId) {
+    creatureViewport.bodyScaleDrag = null;
+    if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
+      elements.creatureViewport.releasePointerCapture(event.pointerId);
+    }
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = true;
+    }
+    markEditorDirty();
+    updateCreatureHover(event);
+    return;
+  }
+
   const drag = creatureViewport.arrowDrag;
 
   if (!drag || drag.pointerId !== event.pointerId) {
     return;
   }
 
+  const shouldSettle = drag.settleAfterRelease;
   creatureViewport.arrowDrag = null;
   if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
     elements.creatureViewport.releasePointerCapture(event.pointerId);
@@ -10517,6 +12181,10 @@ function endCreatureArrowDrag(event) {
   if (creatureViewport.controls) {
     creatureViewport.controls.enabled = true;
   }
+  if (shouldSettle || creatureViewport.pendingSettle) {
+    scheduleCreatureSettle();
+  }
+  markEditorDirty();
   updateCreatureHover(event);
 }
 
@@ -10569,8 +12237,10 @@ function initCreatureViewport() {
   creatureViewport.controls = controls;
   creatureViewport.platformGroup = platformGroup;
   creatureViewport.bodyGroup = bodyGroup;
+  creatureViewport.boneNodes = createInitialCreatureNodes();
+  creatureViewport.nodeBodyRadii = creatureViewport.boneNodes.map(() => creatureBodyRadius);
 
-  rebuildCreatureBody();
+  applyProjectCreatureStateToViewport();
 
   canvas.addEventListener('pointerdown', beginCreatureArrowDrag, true);
   canvas.addEventListener('pointermove', (event) => {
@@ -10580,11 +12250,17 @@ function initCreatureViewport() {
   canvas.addEventListener('pointerup', endCreatureArrowDrag);
   canvas.addEventListener('pointercancel', endCreatureArrowDrag);
   canvas.addEventListener('pointerleave', (event) => {
-    if (creatureViewport.arrowDrag) {
+    if (
+      creatureViewport.arrowDrag
+      || creatureViewport.bodyScaleDrag
+      || creatureViewport.limbAnchorDrag
+      || creatureViewport.limbArrowDrag
+    ) {
       return;
     }
     creatureViewport.hoveredCreature = false;
     creatureViewport.hoveredArrowDirection = null;
+    creatureViewport.hoveredLimbArrowId = null;
     elements.creatureViewport.style.cursor = 'grab';
     updateCreatureHandleVisibility();
   });
@@ -10938,6 +12614,8 @@ elements.openProjectButton.addEventListener('click', openProjectDialog);
 elements.projectViewportTab.addEventListener('click', () => setEditorTab('project'));
 elements.creatureViewportTab.addEventListener('click', () => setEditorTab('creature'));
 elements.newCreatureTabButton.addEventListener('click', openCreatureTab);
+elements.creatureMagneticMovementButton.addEventListener('click', toggleCreatureMagneticMovement);
+elements.creatureLimbPlacementButton.addEventListener('click', toggleCreatureLimbPlacement);
 elements.viewportSelectToolButton.addEventListener('click', () => setViewportTool('select'));
 elements.viewportMoveToolButton.addEventListener('click', () => setViewportTool('move'));
 elements.viewportRotateToolButton.addEventListener('click', () => setViewportTool('rotate'));

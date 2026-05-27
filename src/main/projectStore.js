@@ -61,6 +61,8 @@ function toProjectSummary(project, projectPath) {
     },
     tilesets: Array.isArray(project.tilesets) ? project.tilesets : [],
     scene: project.scene,
+    creature: project.creature ?? null,
+    editorState: project.editorState ?? null,
     path: projectPath
   };
 }
@@ -120,6 +122,11 @@ function createProject({ name = 'Projeto sem titulo', tileSizePixels = defaultTi
         position: [6, 5, 8],
         target: [0, 0, 0]
       }
+    },
+    creature: null,
+    editorState: {
+      activeEditorTab: 'project',
+      creatureTabCreated: false
     }
   };
 
@@ -252,6 +259,14 @@ function listRecentProjects() {
 
   return index.recentProjects
     .filter((item) => item.path && fs.existsSync(path.join(item.path, 'project.json')))
+    .map((item) => {
+      try {
+        const { project } = readProject(item.path);
+        return toProjectSummary(project, item.path);
+      } catch {
+        return item;
+      }
+    })
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
 }
 
