@@ -95,16 +95,22 @@ const creatureViewport = {
   limbControlsGroup: null,
   limbJointTargets: [],
   limbArrowTargets: [],
+  limbBodyScaleTargets: [],
   raycaster: new THREE.Raycaster(),
   pointer: new THREE.Vector2(),
   boneNodes: [],
   nodeBodyRadii: [],
   selectedBodyNodeIndex: null,
+  selectedLimbNode: null,
+  hoveredMainCreature: false,
   hoveredCreature: false,
   hoveredArrowDirection: null,
+  hoveredLimbAnchorId: null,
   arrowDrag: null,
   bodyScaleDrag: null,
+  bodyJointDrag: null,
   limbAnchorDrag: null,
+  limbJointDrag: null,
   limbArrowDrag: null,
   selectedLimbAnchorId: null,
   hoveredLimbArrowId: null,
@@ -1081,11 +1087,27 @@ function normalizeCreatureLimbs(limbs) {
       }
 
       nodes[0] = [...point];
+      const nodeBodyRadii = Array.isArray(limb?.nodeBodyRadii)
+        ? limb.nodeBodyRadii
+          .slice(0, nodes.length)
+          .map((radius) => (
+            THREE.MathUtils.clamp(
+              normalizeNumber(radius, creatureLimbBodyRadius),
+              creatureLimbBodyMinRadius,
+              creatureLimbBodyMaxRadius
+            )
+          ))
+        : [];
+
+      while (nodeBodyRadii.length < nodes.length) {
+        nodeBodyRadii.push(creatureLimbBodyRadius);
+      }
 
       return {
         id: typeof limb?.id === 'string' && limb.id.trim() ? limb.id : `limb-${index}`,
         point: [...point],
-        nodes
+        nodes,
+        nodeBodyRadii
       };
     })
     .filter(Boolean);
@@ -1348,7 +1370,8 @@ function serializeCreatureLimbs() {
   return normalizeCreatureLimbs(creatureViewport.limbAnchors.map((limb) => ({
     id: limb.id,
     point: vectorToArray(limb.point),
-    nodes: limb.nodes.map((node) => vectorToArray(node))
+    nodes: limb.nodes.map((node) => vectorToArray(node)),
+    nodeBodyRadii: [...(limb.nodeBodyRadii || [])]
   })));
 }
 
@@ -1356,7 +1379,8 @@ function deserializeCreatureLimbs(limbs) {
   return normalizeCreatureLimbs(limbs).map((limb) => ({
     id: limb.id,
     point: arrayToVector3(limb.point),
-    nodes: limb.nodes.map((node) => arrayToVector3(node))
+    nodes: limb.nodes.map((node) => arrayToVector3(node)),
+    nodeBodyRadii: [...limb.nodeBodyRadii]
   }));
 }
 
@@ -1428,13 +1452,18 @@ function applyProjectCreatureStateToViewport() {
   creatureViewport.nodeBodyRadii = [...creatureState.nodeBodyRadii];
   creatureViewport.limbAnchors = deserializeCreatureLimbs(creatureState.limbs);
   creatureViewport.selectedBodyNodeIndex = null;
+  creatureViewport.selectedLimbNode = null;
   creatureViewport.selectedLimbAnchorId = null;
+  creatureViewport.hoveredMainCreature = false;
   creatureViewport.hoveredCreature = false;
   creatureViewport.hoveredArrowDirection = null;
+  creatureViewport.hoveredLimbAnchorId = null;
   creatureViewport.hoveredLimbArrowId = null;
   creatureViewport.arrowDrag = null;
   creatureViewport.bodyScaleDrag = null;
+  creatureViewport.bodyJointDrag = null;
   creatureViewport.limbAnchorDrag = null;
+  creatureViewport.limbJointDrag = null;
   creatureViewport.limbArrowDrag = null;
 
   const cameraState = creatureState.viewport.camera;
@@ -10708,6 +10737,8 @@ const creatureEndJointVisualRadius = 0.06;
 const creatureInnerJointVisualRadius = 0.05;
 const creatureMagneticAngleStep = THREE.MathUtils.degToRad(15);
 const creatureLimbBodyRadius = creatureBodyRadius * 0.34;
+const creatureLimbBodyMinRadius = creatureLimbBodyRadius * 0.5;
+const creatureLimbBodyMaxRadius = creatureLimbBodyRadius * 2;
 const creatureLimbJointHitRadius = 0.18;
 const creatureLimbMirrorCenterThreshold = 0.045;
 const creatureLimbArrowOffset = 0.34;
@@ -10925,6 +10956,59 @@ function setCreatureEndNodeDepth(direction, targetZ) {
   endNode.y = anchorNode.y + (isUp ? deltaY : -deltaY);
 }
 
+function getCreatureNodeDepthNearAnchor(targetZ, anchorZ) {
+  const maxDeltaZ = creatureBoneSpacing * 0.92;
+  let nextZ = THREE.MathUtils.clamp(
+    targetZ,
+    anchorZ - maxDeltaZ,
+    anchorZ + maxDeltaZ
+  );
+
+  if (state.creatureMagneticMovement) {
+    const maxAngle = Math.asin(maxDeltaZ / creatureBoneSpacing);
+    const angle = THREE.MathUtils.clamp(
+      Math.asin(THREE.MathUtils.clamp((nextZ - anchorZ) / creatureBoneSpacing, -1, 1)),
+      -maxAngle,
+      maxAngle
+    );
+    const snappedAngle = Math.round(angle / creatureMagneticAngleStep) * creatureMagneticAngleStep;
+    nextZ = anchorZ + (Math.sin(snappedAngle) * creatureBoneSpacing);
+  }
+
+  return THREE.MathUtils.clamp(nextZ, -creatureDepthLimit, creatureDepthLimit);
+}
+
+function moveCreatureBodyJointDepth(nodeIndex, targetZ) {
+  if (!Number.isInteger(nodeIndex) || creatureViewport.boneNodes.length < 2) {
+    return;
+  }
+
+  const nodes = creatureViewport.boneNodes;
+  const clampedIndex = THREE.MathUtils.clamp(nodeIndex, 0, nodes.length - 1);
+  const anchorIndex = clampedIndex > 0 ? clampedIndex - 1 : 1;
+  const anchorNode = nodes[anchorIndex];
+  const oldNodes = nodes.map((node) => node.clone());
+  const movedNode = nodes[clampedIndex];
+  const oldMovedNode = movedNode.clone();
+  const nextZ = getCreatureNodeDepthNearAnchor(targetZ, anchorNode.z);
+  const deltaZ = nextZ - anchorNode.z;
+  const deltaY = Math.sqrt(Math.max(0.001, (creatureBoneSpacing ** 2) - (deltaZ ** 2)));
+
+  movedNode.z = nextZ;
+  movedNode.y = anchorNode.y + (clampedIndex > 0 ? deltaY : -deltaY);
+
+  const delta = movedNode.clone().sub(oldMovedNode);
+  for (let index = clampedIndex + 1; index < nodes.length; index += 1) {
+    nodes[index].add(delta);
+  }
+
+  if (!creatureNodesFitAboveGround()) {
+    nodes.forEach((node, index) => {
+      node.copy(oldNodes[index]);
+    });
+  }
+}
+
 function updateCreatureMagneticMovementButton() {
   if (!elements.creatureMagneticMovementButton) {
     return;
@@ -11047,6 +11131,48 @@ function createCreatureBodyScaleHandle(node, radius, nodeIndex) {
   group.add(shaft, head, jointMarker, hitTarget);
   group.userData.creatureBodyScaleHandle = true;
   group.userData.creatureBodyNodeIndex = nodeIndex;
+  return group;
+}
+
+function createCreatureLimbBodyScaleHandle(node, radius, limbId, nodeIndex, mirrorSign) {
+  const group = new THREE.Group();
+  const side = Math.abs(node.x) > creatureLimbMirrorCenterThreshold ? Math.sign(node.x) : mirrorSign;
+  const direction = new THREE.Vector3(-(side || 1), 0.25, 0).normalize();
+  const startPoint = node.clone().addScaledVector(direction, radius * 0.78);
+  const endPoint = node.clone().addScaledVector(direction, radius + creatureBodyScaleHandleOffset * 0.78);
+  const material = new THREE.MeshStandardMaterial({
+    color: 0x10a510,
+    emissive: 0x087508,
+    emissiveIntensity: 0.16,
+    roughness: 0.48,
+    metalness: 0.04
+  });
+  const shaft = createCylinderBetweenPoints(startPoint, endPoint, 0.022, material, 12);
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.095, 0.18, 24), material);
+  const jointMarker = new THREE.Mesh(new THREE.SphereGeometry(0.045, 18, 12), material);
+  const hitMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false
+  });
+  const hitTarget = createCylinderBetweenPoints(startPoint, endPoint, 0.12, hitMaterial, 16);
+
+  head.position.copy(endPoint);
+  head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+  jointMarker.position.copy(node);
+  [shaft, head, jointMarker, hitTarget].forEach((item) => {
+    item.userData.creatureLimbBodyScaleHandle = true;
+    item.userData.creatureLimbAnchorId = limbId;
+    item.userData.creatureLimbNodeIndex = nodeIndex;
+    item.userData.creatureLimbMirrorSign = mirrorSign;
+  });
+  hitTarget.userData.creatureLimbBodyScaleHitTarget = true;
+  group.add(shaft, head, jointMarker, hitTarget);
+  group.userData.creatureLimbBodyScaleHandle = true;
+  group.userData.creatureLimbAnchorId = limbId;
+  group.userData.creatureLimbNodeIndex = nodeIndex;
+  group.userData.creatureLimbMirrorSign = mirrorSign;
   return group;
 }
 
@@ -11192,6 +11318,25 @@ function getCreatureLimbById(limbId) {
   return creatureViewport.limbAnchors.find((limb) => limb.id === limbId) || null;
 }
 
+function ensureCreatureLimbNodeBodyRadii(limb) {
+  if (!Array.isArray(limb.nodeBodyRadii)) {
+    limb.nodeBodyRadii = [];
+  }
+
+  while (limb.nodeBodyRadii.length < limb.nodes.length) {
+    const copiedRadius = limb.nodeBodyRadii[limb.nodeBodyRadii.length - 1] || creatureLimbBodyRadius;
+    limb.nodeBodyRadii.push(copiedRadius);
+  }
+
+  if (limb.nodeBodyRadii.length > limb.nodes.length) {
+    limb.nodeBodyRadii.length = limb.nodes.length;
+  }
+
+  limb.nodeBodyRadii = limb.nodeBodyRadii.map((radius) => (
+    THREE.MathUtils.clamp(radius || creatureLimbBodyRadius, creatureLimbBodyMinRadius, creatureLimbBodyMaxRadius)
+  ));
+}
+
 function ensureCreatureLimbNodes(limb) {
   if (!Array.isArray(limb.nodes) || !limb.nodes.length) {
     limb.nodes = [limb.point.clone()];
@@ -11201,6 +11346,7 @@ function ensureCreatureLimbNodes(limb) {
   if (limb.nodes.length > creatureMaxBones + 1) {
     limb.nodes.length = creatureMaxBones + 1;
   }
+  ensureCreatureLimbNodeBodyRadii(limb);
 }
 
 function getCreatureLimbSideSign(limb) {
@@ -11275,7 +11421,7 @@ function createCreatureLimbArrowHitTarget(startPoint, endPoint, limbId, mirrorSi
   return [bridge, endHandle];
 }
 
-function createCreatureLimbJointHitTarget(point, limbId, mirrorSign) {
+function createCreatureLimbJointHitTarget(point, limbId, nodeIndex, mirrorSign) {
   const material = new THREE.MeshBasicMaterial({
     color: 0xffffff,
     transparent: true,
@@ -11286,23 +11432,27 @@ function createCreatureLimbJointHitTarget(point, limbId, mirrorSign) {
 
   target.position.copy(point);
   target.userData.creatureLimbAnchorId = limbId;
+  target.userData.creatureLimbNodeIndex = nodeIndex;
   target.userData.creatureLimbMirrorSign = mirrorSign;
-  target.userData.creatureLimbAnchorHitTarget = true;
+  target.userData.creatureLimbJointHitTarget = true;
   target.renderOrder = -1;
   return target;
 }
 
-function createCreatureLimbSurfaceSkin(nodes, material) {
+function createCreatureLimbSurfaceSkin(limb, nodes, material, mirrorSign) {
   if (nodes.length < 2) {
     return [];
   }
 
-  const radii = nodes.map((_, index) => (
-    index === 0 ? creatureLimbBodyRadius * 0.82 : creatureLimbBodyRadius
+  ensureCreatureLimbNodeBodyRadii(limb);
+  const radii = limb.nodeBodyRadii.map((radius, index) => (
+    index === 0 ? radius * 0.82 : radius
   ));
 
   return createCreatureBodyMeshes(nodes, radii, material).map((mesh) => {
     mesh.userData.creatureLimbBody = true;
+    mesh.userData.creatureLimbBodyId = limb.id;
+    mesh.userData.creatureLimbMirrorSign = mirrorSign;
     return mesh;
   });
 }
@@ -11314,7 +11464,7 @@ function renderCreatureLimbCopy(limb, nodes, mirrorSign, materials) {
   const arrow = createCreatureLimb('up');
   const arrowEnd = endPoint.clone().addScaledVector(arrowDirection, creatureLimbArrowOffset);
 
-  createCreatureLimbSurfaceSkin(nodes, materials.body).forEach((mesh) => {
+  createCreatureLimbSurfaceSkin(limb, nodes, materials.body, mirrorSign).forEach((mesh) => {
     creatureViewport.bodyGroup.add(mesh);
     creatureViewport.bodyMeshes.push(mesh);
   });
@@ -11335,15 +11485,14 @@ function renderCreatureLimbCopy(limb, nodes, mirrorSign, materials) {
 
     joint.position.copy(node);
     joint.userData.creatureLimbAnchorId = limb.id;
+    joint.userData.creatureLimbNodeIndex = index;
     joint.userData.creatureLimbMirrorSign = mirrorSign;
     joint.userData.creatureLimbJoint = true;
     controlsGroup.add(joint);
 
-    if (isAnchor) {
-      const hitTarget = createCreatureLimbJointHitTarget(node, limb.id, mirrorSign);
-      controlsGroup.add(hitTarget);
-      creatureViewport.limbJointTargets.push(joint, hitTarget);
-    }
+    const hitTarget = createCreatureLimbJointHitTarget(node, limb.id, index, mirrorSign);
+    controlsGroup.add(hitTarget);
+    creatureViewport.limbJointTargets.push(joint, hitTarget);
   });
 
   arrow.position.copy(arrowEnd);
@@ -11361,6 +11510,33 @@ function renderCreatureLimbCopy(limb, nodes, mirrorSign, materials) {
     controlsGroup.add(target);
     creatureViewport.limbArrowTargets.push(target);
   });
+
+  if (
+    creatureViewport.selectedLimbNode
+    && creatureViewport.selectedLimbNode.limbId === limb.id
+    && creatureViewport.selectedLimbNode.mirrorSign === mirrorSign
+    && Number.isInteger(creatureViewport.selectedLimbNode.nodeIndex)
+  ) {
+    const selectedIndex = creatureViewport.selectedLimbNode.nodeIndex;
+    const selectedNode = nodes[selectedIndex];
+    const selectedRadius = limb.nodeBodyRadii[selectedIndex] || creatureLimbBodyRadius;
+
+    if (selectedNode) {
+      const scaleHandle = createCreatureLimbBodyScaleHandle(
+        selectedNode,
+        selectedRadius,
+        limb.id,
+        selectedIndex,
+        mirrorSign
+      );
+      controlsGroup.add(scaleHandle);
+      scaleHandle.traverse((child) => {
+        if (child.userData.creatureLimbBodyScaleHandle) {
+          creatureViewport.limbBodyScaleTargets.push(child);
+        }
+      });
+    }
+  }
 }
 
 function renderCreatureLimbs(materials) {
@@ -11377,16 +11553,24 @@ function renderCreatureLimbs(materials) {
 }
 
 function updateCreatureHandleVisibility() {
-  const shouldShow = creatureViewport.hoveredCreature
+  const shouldShowMainControls = creatureViewport.hoveredMainCreature
     || Boolean(creatureViewport.arrowDrag)
+    || Boolean(creatureViewport.bodyJointDrag)
+    || Boolean(creatureViewport.bodyScaleDrag);
+  const shouldShowCreature = shouldShowMainControls
     || Boolean(creatureViewport.limbAnchorDrag)
-    || Boolean(creatureViewport.limbArrowDrag);
-  const shouldShowLimbControls = shouldShow
+    || Boolean(creatureViewport.limbJointDrag)
+    || Boolean(creatureViewport.limbArrowDrag)
+    || Boolean(creatureViewport.hoveredLimbAnchorId)
+    || Boolean(creatureViewport.hoveredLimbArrowId);
+  const hasBareLimbAnchor = creatureViewport.limbAnchors.some((limb) => limb.nodes.length <= 1);
+  const shouldShowLimbControls = shouldShowCreature
     || state.creatureLimbPlacement
-    || Boolean(creatureViewport.selectedLimbAnchorId);
+    || Boolean(creatureViewport.selectedLimbNode)
+    || hasBareLimbAnchor;
 
   if (creatureViewport.skeletonGroup) {
-    creatureViewport.skeletonGroup.visible = shouldShow;
+    creatureViewport.skeletonGroup.visible = shouldShowMainControls;
   }
 
   if (creatureViewport.limbControlsGroup) {
@@ -11395,12 +11579,12 @@ function updateCreatureHandleVisibility() {
 
   creatureViewport.bodyMeshes.forEach((mesh) => {
     if (mesh.material) {
-      const shouldBeTransparent = shouldShow;
+      const shouldBeTransparent = shouldShowCreature;
       if (mesh.material.transparent !== shouldBeTransparent) {
         mesh.material.transparent = shouldBeTransparent;
         mesh.material.needsUpdate = true;
       }
-      mesh.material.opacity = shouldShow ? 0.62 : 1;
+      mesh.material.opacity = shouldShowCreature ? 0.62 : 1;
     }
   });
 
@@ -11408,7 +11592,7 @@ function updateCreatureHandleVisibility() {
     const direction = arrow.userData.creatureArrowDirection;
     const isLimit = getCreatureBoneCount() >= creatureMaxBones;
     const isHovered = arrow.userData.creatureArrowDirection === creatureViewport.hoveredArrowDirection;
-    arrow.visible = shouldShow || isHovered;
+    arrow.visible = shouldShowMainControls || isHovered;
     if (arrow.userData.creatureArrowHitTarget) {
       arrow.traverse((child) => {
         if (child.material) {
@@ -11442,9 +11626,16 @@ function updateCreatureHandleVisibility() {
   });
 
   creatureViewport.limbArrowTargets.forEach((target) => {
-    const isHovered = target.userData.creatureLimbArrowId === creatureViewport.hoveredLimbArrowId;
+    const limbId = target.userData.creatureLimbArrowId;
+    const isHovered = limbId === creatureViewport.hoveredLimbArrowId
+      || limbId === creatureViewport.hoveredLimbAnchorId;
+    const isDragging = limbId === creatureViewport.limbArrowDrag?.limbId
+      || limbId === creatureViewport.limbJointDrag?.limbId
+      || limbId === creatureViewport.limbAnchorDrag?.limbId;
+    const shouldShowArrow = isHovered || isDragging;
 
     if (target.userData.creatureLimbArrowHitTarget) {
+      target.visible = shouldShowLimbControls || shouldShowArrow;
       target.traverse((child) => {
         if (child.material) {
           child.material.opacity = 0;
@@ -11455,6 +11646,7 @@ function updateCreatureHandleVisibility() {
       return;
     }
 
+    target.visible = shouldShowArrow;
     target.traverse((child) => {
       if (child.material) {
         child.material.opacity = isHovered ? 1 : 0.78;
@@ -11464,7 +11656,20 @@ function updateCreatureHandleVisibility() {
   });
 
   creatureViewport.limbJointTargets.forEach((target) => {
-    if (target.userData.creatureLimbAnchorHitTarget) {
+    if (target.userData.creatureLimbJointHitTarget) {
+      target.traverse((child) => {
+        if (child.material) {
+          child.material.opacity = 0;
+          child.material.transparent = true;
+          child.material.depthWrite = false;
+        }
+      });
+    }
+  });
+
+  creatureViewport.limbBodyScaleTargets.forEach((target) => {
+    target.visible = Boolean(creatureViewport.selectedLimbNode);
+    if (target.userData.creatureLimbBodyScaleHitTarget) {
       target.traverse((child) => {
         if (child.material) {
           child.material.opacity = 0;
@@ -11491,6 +11696,7 @@ function rebuildCreatureBody(options = {}) {
   creatureViewport.limbControlsGroup = null;
   creatureViewport.limbJointTargets = [];
   creatureViewport.limbArrowTargets = [];
+  creatureViewport.limbBodyScaleTargets = [];
   if (creatureViewport.boneNodes.length < 2) {
     creatureViewport.boneNodes = createInitialCreatureNodes();
   }
@@ -11500,6 +11706,12 @@ function rebuildCreatureBody(options = {}) {
     && creatureViewport.selectedBodyNodeIndex >= creatureViewport.boneNodes.length
   ) {
     creatureViewport.selectedBodyNodeIndex = null;
+  }
+  if (creatureViewport.selectedLimbNode) {
+    const selectedLimb = getCreatureLimbById(creatureViewport.selectedLimbNode.limbId);
+    if (!selectedLimb || creatureViewport.selectedLimbNode.nodeIndex >= selectedLimb.nodes.length) {
+      creatureViewport.selectedLimbNode = null;
+    }
   }
   if (!options.preserveHeight) {
     normalizeCreatureNodeHeight();
@@ -11646,6 +11858,12 @@ function getCreatureBodyScaleIntersection(event) {
   return intersections.find((intersection) => intersection.object.userData?.creatureBodyScaleHandle) || null;
 }
 
+function getCreatureLimbBodyScaleIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.limbBodyScaleTargets, true);
+  return intersections.find((intersection) => intersection.object.userData?.creatureLimbBodyScaleHandle) || null;
+}
+
 function getCreatureJointIntersection(event) {
   updateCreatureRayFromPointerEvent(event);
   const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.jointTargets, true);
@@ -11713,6 +11931,7 @@ function clampCreatureLimbTarget(limb, target) {
 
 function updateCreatureLimbChainFromTarget(limb, target) {
   ensureCreatureLimbNodes(limb);
+  ensureCreatureLimbNodeBodyRadii(limb);
   const nodes = limb.nodes;
   const segmentCount = nodes.length - 1;
 
@@ -11721,6 +11940,7 @@ function updateCreatureLimbChainFromTarget(limb, target) {
 
     if (direction.length() > creatureBoneSpacing * 0.55) {
       nodes.push(nodes[0].clone().addScaledVector(direction.normalize(), creatureBoneSpacing));
+      limb.nodeBodyRadii.push(limb.nodeBodyRadii[0] || creatureLimbBodyRadius);
     }
 
     return;
@@ -11732,6 +11952,7 @@ function updateCreatureLimbChainFromTarget(limb, target) {
 
   if (distance < creatureBoneSpacing * 0.34) {
     nodes.pop();
+    limb.nodeBodyRadii.pop();
     return;
   }
 
@@ -11743,6 +11964,32 @@ function updateCreatureLimbChainFromTarget(limb, target) {
 
   if (distance > creatureBoneSpacing * 1.48 && segmentCount < creatureMaxBones) {
     nodes.push(nodes[nodes.length - 1].clone().addScaledVector(direction, creatureBoneSpacing));
+    limb.nodeBodyRadii.push(limb.nodeBodyRadii[limb.nodeBodyRadii.length - 1] || creatureLimbBodyRadius);
+  }
+}
+
+function moveCreatureLimbNode(limb, nodeIndex, target) {
+  ensureCreatureLimbNodes(limb);
+
+  if (!Number.isInteger(nodeIndex) || nodeIndex <= 0 || nodeIndex >= limb.nodes.length) {
+    return;
+  }
+
+  const nodes = limb.nodes;
+  const previousNode = nodes[nodeIndex - 1];
+  const direction = target.clone().sub(previousNode);
+
+  if (direction.lengthSq() < 0.0001) {
+    return;
+  }
+
+  const oldNode = nodes[nodeIndex].clone();
+  const nextNode = previousNode.clone().addScaledVector(direction.normalize(), creatureBoneSpacing);
+  const delta = nextNode.clone().sub(oldNode);
+
+  nodes[nodeIndex].copy(nextNode);
+  for (let index = nodeIndex + 1; index < nodes.length; index += 1) {
+    nodes[index].add(delta);
   }
 }
 
@@ -11751,11 +11998,13 @@ function addCreatureLimbAnchor(surfacePoint) {
   const limb = {
     id: createCreatureLimbId(),
     point,
-    nodes: [point.clone()]
+    nodes: [point.clone()],
+    nodeBodyRadii: [creatureLimbBodyRadius]
   };
 
   creatureViewport.limbAnchors.push(limb);
   creatureViewport.selectedLimbAnchorId = limb.id;
+  creatureViewport.selectedLimbNode = null;
   creatureViewport.selectedBodyNodeIndex = null;
   rebuildCreatureBody({ preserveHeight: true });
   markEditorDirty();
@@ -11772,6 +12021,9 @@ function removeCreatureLimbAnchor(limbId) {
   creatureViewport.limbAnchors = nextAnchors;
   if (creatureViewport.selectedLimbAnchorId === limbId) {
     creatureViewport.selectedLimbAnchorId = null;
+  }
+  if (creatureViewport.selectedLimbNode?.limbId === limbId) {
+    creatureViewport.selectedLimbNode = null;
   }
   rebuildCreatureBody({ preserveHeight: true });
   markEditorDirty();
@@ -11794,13 +12046,17 @@ function updateCreatureHover(event) {
     !creatureViewport.initialized
     || creatureViewport.arrowDrag
     || creatureViewport.bodyScaleDrag
+    || creatureViewport.bodyJointDrag
     || creatureViewport.limbAnchorDrag
+    || creatureViewport.limbJointDrag
     || creatureViewport.limbArrowDrag
   ) {
     return;
   }
 
   updateCreatureRayFromPointerEvent(event);
+  const limbScaleIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.limbBodyScaleTargets, true)
+    .find((intersection) => intersection.object.userData?.creatureLimbBodyScaleHandle);
   const limbArrowIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.limbArrowTargets, true)
     .find((intersection) => intersection.object.userData?.creatureLimbArrowId);
   const limbJointIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.limbJointTargets, true)
@@ -11811,29 +12067,66 @@ function updateCreatureHover(event) {
     .find((intersection) => intersection.object.userData?.creatureBodyScaleHandle);
   const jointIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.jointTargets, true)
     .find((intersection) => Number.isInteger(intersection.object.userData?.creatureJointIndex));
-  const bodyIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyMeshes, false)[0];
+  const bodyIntersections = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyMeshes, false);
+  const bodyIntersection = bodyIntersections[0];
+  const mainBodyIntersection = bodyIntersections.find((intersection) => !intersection.object.userData.creatureLimbBody);
+  const limbBodyIntersection = bodyIntersections.find((intersection) => intersection.object.userData.creatureLimbBody);
 
   creatureViewport.hoveredArrowDirection = arrowIntersection?.object.userData.creatureArrowDirection || null;
   creatureViewport.hoveredLimbArrowId = limbArrowIntersection?.object.userData.creatureLimbArrowId || null;
+  creatureViewport.hoveredMainCreature = Boolean(arrowIntersection || scaleIntersection || jointIntersection || mainBodyIntersection);
+  creatureViewport.hoveredLimbAnchorId = limbJointIntersection?.object.userData.creatureLimbAnchorId
+    || limbBodyIntersection?.object.userData.creatureLimbBodyId
+    || null;
   creatureViewport.hoveredCreature = Boolean(
-    limbArrowIntersection
+    limbScaleIntersection
+    || limbArrowIntersection
     || limbJointIntersection
     || arrowIntersection
     || scaleIntersection
     || jointIntersection
     || bodyIntersection
   );
-  elements.creatureViewport.style.cursor = scaleIntersection
+  elements.creatureViewport.style.cursor = scaleIntersection || limbScaleIntersection
     ? 'ew-resize'
     : (
       limbJointIntersection || jointIntersection
         ? 'pointer'
-        : (limbArrowIntersection || arrowIntersection ? 'grab' : (state.creatureLimbPlacement && bodyIntersection ? 'crosshair' : 'grab'))
+        : (limbArrowIntersection || arrowIntersection ? 'grab' : (state.creatureLimbPlacement && mainBodyIntersection ? 'crosshair' : 'grab'))
     );
   updateCreatureHandleVisibility();
 }
 
 function beginCreatureArrowDrag(event) {
+  const limbScaleIntersection = getCreatureLimbBodyScaleIntersection(event);
+  const limbScaleId = limbScaleIntersection?.object.userData?.creatureLimbAnchorId;
+  const limbScaleNodeIndex = limbScaleIntersection?.object.userData?.creatureLimbNodeIndex;
+
+  if (limbScaleId && Number.isInteger(limbScaleNodeIndex)) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const limb = getCreatureLimbById(limbScaleId);
+    if (!limb) {
+      return true;
+    }
+    ensureCreatureLimbNodes(limb);
+    creatureViewport.bodyScaleDrag = {
+      pointerId: event.pointerId,
+      targetType: 'limb',
+      limbId: limbScaleId,
+      nodeIndex: limbScaleNodeIndex,
+      mirrorSign: limbScaleIntersection.object.userData.creatureLimbMirrorSign === -1 ? -1 : 1,
+      startClientX: event.clientX,
+      startRadius: limb?.nodeBodyRadii?.[limbScaleNodeIndex] || creatureLimbBodyRadius
+    };
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = false;
+    }
+    elements.creatureViewport.style.cursor = 'ew-resize';
+    elements.creatureViewport.setPointerCapture(event.pointerId);
+    return true;
+  }
+
   const limbArrowIntersection = getCreatureLimbArrowIntersection(event);
   const limbArrowId = limbArrowIntersection?.object.userData?.creatureLimbArrowId;
 
@@ -11842,6 +12135,7 @@ function beginCreatureArrowDrag(event) {
     event.stopImmediatePropagation();
     cancelCreatureSettle();
     creatureViewport.selectedLimbAnchorId = limbArrowId;
+    creatureViewport.selectedLimbNode = null;
     creatureViewport.selectedBodyNodeIndex = null;
     creatureViewport.limbArrowDrag = {
       pointerId: event.pointerId,
@@ -11859,8 +12153,9 @@ function beginCreatureArrowDrag(event) {
 
   const limbJointIntersection = getCreatureLimbJointIntersection(event);
   const limbAnchorId = limbJointIntersection?.object.userData?.creatureLimbAnchorId;
+  const limbNodeIndex = limbJointIntersection?.object.userData?.creatureLimbNodeIndex;
 
-  if (limbAnchorId) {
+  if (limbAnchorId && Number.isInteger(limbNodeIndex)) {
     event.preventDefault();
     event.stopImmediatePropagation();
 
@@ -11870,12 +12165,26 @@ function beginCreatureArrowDrag(event) {
     }
 
     creatureViewport.selectedLimbAnchorId = limbAnchorId;
-    creatureViewport.selectedBodyNodeIndex = null;
-    creatureViewport.limbAnchorDrag = {
-      pointerId: event.pointerId,
+    creatureViewport.selectedLimbNode = {
       limbId: limbAnchorId,
+      nodeIndex: limbNodeIndex,
       mirrorSign: limbJointIntersection.object.userData.creatureLimbMirrorSign === -1 ? -1 : 1
     };
+    creatureViewport.selectedBodyNodeIndex = null;
+    if (limbNodeIndex === 0) {
+      creatureViewport.limbAnchorDrag = {
+        pointerId: event.pointerId,
+        limbId: limbAnchorId,
+        mirrorSign: limbJointIntersection.object.userData.creatureLimbMirrorSign === -1 ? -1 : 1
+      };
+    } else {
+      creatureViewport.limbJointDrag = {
+        pointerId: event.pointerId,
+        limbId: limbAnchorId,
+        nodeIndex: limbNodeIndex,
+        mirrorSign: limbJointIntersection.object.userData.creatureLimbMirrorSign === -1 ? -1 : 1
+      };
+    }
     if (creatureViewport.controls) {
       creatureViewport.controls.enabled = false;
     }
@@ -11895,6 +12204,7 @@ function beginCreatureArrowDrag(event) {
     ensureCreatureNodeBodyRadii();
     creatureViewport.bodyScaleDrag = {
       pointerId: event.pointerId,
+      targetType: 'body',
       nodeIndex: scaleNodeIndex,
       startClientX: event.clientX,
       startRadius: creatureViewport.nodeBodyRadii[scaleNodeIndex] || creatureBodyRadius
@@ -11913,8 +12223,23 @@ function beginCreatureArrowDrag(event) {
   if (Number.isInteger(jointIndex)) {
     event.preventDefault();
     event.stopImmediatePropagation();
+    cancelCreatureSettle();
     creatureViewport.selectedBodyNodeIndex = jointIndex;
+    creatureViewport.selectedLimbNode = null;
     creatureViewport.selectedLimbAnchorId = null;
+    const planePointForJoint = getCreaturePlanePointFromPointerEvent(event);
+    if (planePointForJoint) {
+      creatureViewport.bodyJointDrag = {
+        pointerId: event.pointerId,
+        nodeIndex: jointIndex,
+        zPointerOffset: creatureViewport.boneNodes[jointIndex].z - planePointForJoint.z
+      };
+      if (creatureViewport.controls) {
+        creatureViewport.controls.enabled = false;
+      }
+      elements.creatureViewport.style.cursor = 'grabbing';
+      elements.creatureViewport.setPointerCapture(event.pointerId);
+    }
     rebuildCreatureBody({ preserveHeight: true });
     return true;
   }
@@ -11937,6 +12262,7 @@ function beginCreatureArrowDrag(event) {
 
     if (!bodyIntersection && (creatureViewport.selectedBodyNodeIndex !== null || creatureViewport.selectedLimbAnchorId !== null)) {
       creatureViewport.selectedBodyNodeIndex = null;
+      creatureViewport.selectedLimbNode = null;
       creatureViewport.selectedLimbAnchorId = null;
       rebuildCreatureBody({ preserveHeight: true });
     }
@@ -11982,6 +12308,36 @@ function updateCreatureArrowDrag(event) {
     return;
   }
 
+  const limbJointDrag = creatureViewport.limbJointDrag;
+
+  if (limbJointDrag && limbJointDrag.pointerId === event.pointerId) {
+    event.preventDefault();
+    const limb = getCreatureLimbById(limbJointDrag.limbId);
+
+    if (!limb) {
+      return;
+    }
+
+    ensureCreatureLimbNodes(limb);
+    const node = limb.nodes[limbJointDrag.nodeIndex];
+    const renderedNode = limbJointDrag.mirrorSign === -1
+      ? mirrorCreatureLimbVector(node)
+      : node.clone();
+    const planePoint = getCreaturePointerPointOnCameraPlane(event, renderedNode);
+
+    if (!planePoint) {
+      return;
+    }
+
+    const target = clampCreatureLimbTarget(
+      limb,
+      getCanonicalCreatureLimbPoint(planePoint, limbJointDrag.mirrorSign)
+    );
+    moveCreatureLimbNode(limb, limbJointDrag.nodeIndex, target);
+    rebuildCreatureBody({ preserveHeight: true });
+    return;
+  }
+
   const limbArrowDrag = creatureViewport.limbArrowDrag;
 
   if (limbArrowDrag && limbArrowDrag.pointerId === event.pointerId) {
@@ -12016,14 +12372,45 @@ function updateCreatureArrowDrag(event) {
 
   if (scaleDrag && scaleDrag.pointerId === event.pointerId) {
     event.preventDefault();
-    ensureCreatureNodeBodyRadii();
     const radiusDelta = -(event.clientX - scaleDrag.startClientX) / 240;
-    const node = creatureViewport.boneNodes[scaleDrag.nodeIndex];
-    const groundLimitedMaxRadius = node ? Math.max(creatureBodyMinRadius, node.y - creatureGroundLimitY) : creatureBodyMaxRadius;
-    creatureViewport.nodeBodyRadii[scaleDrag.nodeIndex] = THREE.MathUtils.clamp(
-      scaleDrag.startRadius + radiusDelta,
-      creatureBodyMinRadius,
-      Math.min(creatureBodyMaxRadius, groundLimitedMaxRadius)
+
+    if (scaleDrag.targetType === 'limb') {
+      const limb = getCreatureLimbById(scaleDrag.limbId);
+      if (limb) {
+        ensureCreatureLimbNodes(limb);
+        limb.nodeBodyRadii[scaleDrag.nodeIndex] = THREE.MathUtils.clamp(
+          scaleDrag.startRadius + radiusDelta,
+          creatureLimbBodyMinRadius,
+          creatureLimbBodyMaxRadius
+        );
+      }
+    } else {
+      ensureCreatureNodeBodyRadii();
+      const node = creatureViewport.boneNodes[scaleDrag.nodeIndex];
+      const groundLimitedMaxRadius = node ? Math.max(creatureBodyMinRadius, node.y - creatureGroundLimitY) : creatureBodyMaxRadius;
+      creatureViewport.nodeBodyRadii[scaleDrag.nodeIndex] = THREE.MathUtils.clamp(
+        scaleDrag.startRadius + radiusDelta,
+        creatureBodyMinRadius,
+        Math.min(creatureBodyMaxRadius, groundLimitedMaxRadius)
+      );
+    }
+    rebuildCreatureBody({ preserveHeight: true });
+    return;
+  }
+
+  const bodyJointDrag = creatureViewport.bodyJointDrag;
+
+  if (bodyJointDrag && bodyJointDrag.pointerId === event.pointerId) {
+    event.preventDefault();
+    const planePoint = getCreaturePlanePointFromPointerEvent(event);
+
+    if (!planePoint) {
+      return;
+    }
+
+    moveCreatureBodyJointDepth(
+      bodyJointDrag.nodeIndex,
+      planePoint.z + bodyJointDrag.zPointerOffset
     );
     rebuildCreatureBody({ preserveHeight: true });
     return;
@@ -12137,6 +12524,21 @@ function endCreatureArrowDrag(event) {
     return;
   }
 
+  const limbJointDrag = creatureViewport.limbJointDrag;
+
+  if (limbJointDrag && limbJointDrag.pointerId === event.pointerId) {
+    creatureViewport.limbJointDrag = null;
+    if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
+      elements.creatureViewport.releasePointerCapture(event.pointerId);
+    }
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = true;
+    }
+    markEditorDirty();
+    updateCreatureHover(event);
+    return;
+  }
+
   const limbArrowDrag = creatureViewport.limbArrowDrag;
 
   if (limbArrowDrag && limbArrowDrag.pointerId === event.pointerId) {
@@ -12156,6 +12558,21 @@ function endCreatureArrowDrag(event) {
 
   if (scaleDrag && scaleDrag.pointerId === event.pointerId) {
     creatureViewport.bodyScaleDrag = null;
+    if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
+      elements.creatureViewport.releasePointerCapture(event.pointerId);
+    }
+    if (creatureViewport.controls) {
+      creatureViewport.controls.enabled = true;
+    }
+    markEditorDirty();
+    updateCreatureHover(event);
+    return;
+  }
+
+  const bodyJointDrag = creatureViewport.bodyJointDrag;
+
+  if (bodyJointDrag && bodyJointDrag.pointerId === event.pointerId) {
+    creatureViewport.bodyJointDrag = null;
     if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
       elements.creatureViewport.releasePointerCapture(event.pointerId);
     }
@@ -12253,13 +12670,17 @@ function initCreatureViewport() {
     if (
       creatureViewport.arrowDrag
       || creatureViewport.bodyScaleDrag
+      || creatureViewport.bodyJointDrag
       || creatureViewport.limbAnchorDrag
+      || creatureViewport.limbJointDrag
       || creatureViewport.limbArrowDrag
     ) {
       return;
     }
+    creatureViewport.hoveredMainCreature = false;
     creatureViewport.hoveredCreature = false;
     creatureViewport.hoveredArrowDirection = null;
+    creatureViewport.hoveredLimbAnchorId = null;
     creatureViewport.hoveredLimbArrowId = null;
     elements.creatureViewport.style.cursor = 'grab';
     updateCreatureHandleVisibility();
