@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
@@ -31,6 +30,10 @@ const state = {
   pendingTilesetImportId: null,
   customColorTargetIndex: null,
   activeTool: 'select',
+  activeEditorTab: 'project',
+  creatureTabCreated: false,
+  projectLeftPanelCollapsed: false,
+  creatureLeftPanelCollapsed: false,
   viewportTool: 'select',
   roundingControlMode: 'edge',
   propertyAccordionOpenKey: 'basic',
@@ -49,6 +52,8 @@ const viewport = {
   animationId: null,
   objectGroup: null,
   sceneObjectMeshes: new Map(),
+  geometryCache: new Map(),
+  materialCache: new Map(),
   textureCache: new Map(),
   paintCanvasCache: new Map(),
   paintTextureCache: new Map(),
@@ -67,6 +72,26 @@ const viewport = {
   transformHandleGroup: null,
   transformHandleTargets: [],
   hoveredTransformTarget: null
+};
+
+const creatureViewport = {
+  initialized: false,
+  renderer: null,
+  scene: null,
+  camera: null,
+  controls: null,
+  platformGroup: null,
+  animationId: null,
+  bodyGroup: null,
+  skeletonGroup: null,
+  bodyMeshes: [],
+  arrowTargets: [],
+  raycaster: new THREE.Raycaster(),
+  pointer: new THREE.Vector2(),
+  boneOffsets: [0],
+  hoveredCreature: false,
+  hoveredArrowDirection: null,
+  arrowDrag: null
 };
 
 const viewportInteraction = {
@@ -128,9 +153,219 @@ const gltfLoader = new GLTFLoader();
 const objLoader = new OBJLoader();
 let roundingModeMenuCloseTimer = null;
 
+class StableOrbitControls {
+  constructor(camera, domElement) {
+    this.camera = camera;
+    this.domElement = domElement;
+    this.enabled = true;
+    this.noRotate = false;
+    this.noZoom = false;
+    this.noPan = false;
+    this.rotateSpeed = 1;
+    this.zoomSpeed = 1;
+    this.panSpeed = 1;
+    this.minDistance = 0.15;
+    this.maxDistance = 300;
+    this.minPitch = null;
+    this.maxPitch = null;
+    this.target = new THREE.Vector3();
+    this.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN
+    };
+    this.state = null;
+    this.pointerId = null;
+    this.start = new THREE.Vector2();
+    this.yaw = 0;
+    this.pitch = 0;
+    this.radius = 1;
+
+    this.handlePointerDown = this.handlePointerDown.bind(this);
+    this.handlePointerMove = this.handlePointerMove.bind(this);
+    this.handlePointerUp = this.handlePointerUp.bind(this);
+    this.handleWheel = this.handleWheel.bind(this);
+    this.handleContextMenu = this.handleContextMenu.bind(this);
+
+    this.domElement.addEventListener('pointerdown', this.handlePointerDown);
+    this.domElement.addEventListener('wheel', this.handleWheel, { passive: false });
+    this.domElement.addEventListener('contextmenu', this.handleContextMenu);
+    this.syncFromCamera();
+  }
+
+  syncFromCamera() {
+    const offset = this.camera.position.clone().sub(this.target);
+    this.radius = Math.max(0.001, offset.length());
+    const basePitch = Math.asin(THREE.MathUtils.clamp(offset.y / this.radius, -1, 1));
+
+    this.pitch = this.camera.up.y < 0 ? Math.PI - basePitch : basePitch;
+    this.yaw = Math.atan2(offset.x, offset.z);
+
+    if (this.camera.up.y < 0) {
+      this.yaw -= Math.PI;
+    }
+  }
+
+  getMouseAction(event) {
+    if (event.button === 0) {
+      return this.mouseButtons.LEFT;
+    }
+
+    if (event.button === 1) {
+      return this.mouseButtons.MIDDLE;
+    }
+
+    if (event.button === 2) {
+      return this.mouseButtons.RIGHT;
+    }
+
+    return null;
+  }
+
+  handlePointerDown(event) {
+    if (!this.enabled || this.pointerId !== null) {
+      return;
+    }
+
+    const action = this.getMouseAction(event);
+
+    if (
+      action === null
+      || (action === THREE.MOUSE.ROTATE && this.noRotate)
+      || (action === THREE.MOUSE.DOLLY && this.noZoom)
+      || (action === THREE.MOUSE.PAN && this.noPan)
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    this.state = action;
+    this.pointerId = event.pointerId;
+    this.start.set(event.clientX, event.clientY);
+    this.syncFromCamera();
+    this.domElement.setPointerCapture(event.pointerId);
+    this.domElement.ownerDocument.addEventListener('pointermove', this.handlePointerMove);
+    this.domElement.ownerDocument.addEventListener('pointerup', this.handlePointerUp);
+  }
+
+  handlePointerMove(event) {
+    if (!this.enabled || event.pointerId !== this.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - this.start.x;
+    const deltaY = event.clientY - this.start.y;
+    this.start.set(event.clientX, event.clientY);
+
+    if (this.state === THREE.MOUSE.ROTATE && !this.noRotate) {
+      const rotateScale = (Math.PI * 2 * this.rotateSpeed) / Math.max(1, this.domElement.clientHeight);
+      this.yaw -= deltaX * rotateScale;
+      this.pitch += deltaY * rotateScale;
+      this.clampPitch();
+      this.applyCameraTransform();
+      return;
+    }
+
+    if (this.state === THREE.MOUSE.DOLLY && !this.noZoom) {
+      this.dolly(deltaY);
+      return;
+    }
+
+    if (this.state === THREE.MOUSE.PAN && !this.noPan) {
+      this.pan(deltaX, deltaY);
+    }
+  }
+
+  handlePointerUp(event) {
+    if (event.pointerId !== this.pointerId) {
+      return;
+    }
+
+    this.state = null;
+    this.pointerId = null;
+    if (this.domElement.hasPointerCapture(event.pointerId)) {
+      this.domElement.releasePointerCapture(event.pointerId);
+    }
+    this.domElement.ownerDocument.removeEventListener('pointermove', this.handlePointerMove);
+    this.domElement.ownerDocument.removeEventListener('pointerup', this.handlePointerUp);
+  }
+
+  handleWheel(event) {
+    if (!this.enabled || this.noZoom || this.state !== null) {
+      return;
+    }
+
+    event.preventDefault();
+    this.syncFromCamera();
+    this.dolly(event.deltaY);
+  }
+
+  handleContextMenu(event) {
+    if (this.enabled) {
+      event.preventDefault();
+    }
+  }
+
+  dolly(deltaY) {
+    const normalizedDelta = Math.abs(deltaY * 0.01);
+    const zoomScale = Math.pow(0.95, this.zoomSpeed * normalizedDelta);
+    this.radius *= deltaY < 0 ? zoomScale : 1 / zoomScale;
+    this.radius = Math.max(this.minDistance, Math.min(this.maxDistance, this.radius));
+    this.applyCameraTransform();
+  }
+
+  pan(deltaX, deltaY) {
+    this.camera.updateMatrixWorld();
+    const offset = this.camera.position.clone().sub(this.target);
+    const targetDistance = offset.length() * Math.tan(THREE.MathUtils.DEG2RAD * this.camera.fov * 0.5);
+    const panX = (-2 * deltaX * targetDistance * this.panSpeed) / Math.max(1, this.domElement.clientHeight);
+    const panY = (2 * deltaY * targetDistance * this.panSpeed) / Math.max(1, this.domElement.clientHeight);
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0).multiplyScalar(panX);
+    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1).multiplyScalar(panY);
+    const panOffset = right.add(up);
+
+    this.target.add(panOffset);
+    this.camera.position.add(panOffset);
+    this.syncFromCamera();
+  }
+
+  clampPitch() {
+    if (Number.isFinite(this.minPitch)) {
+      this.pitch = Math.max(this.minPitch, this.pitch);
+    }
+
+    if (Number.isFinite(this.maxPitch)) {
+      this.pitch = Math.min(this.maxPitch, this.pitch);
+    }
+  }
+
+  applyCameraTransform() {
+    this.clampPitch();
+    const cosPitch = Math.cos(this.pitch);
+    const offset = new THREE.Vector3(
+      this.radius * cosPitch * Math.sin(this.yaw),
+      this.radius * Math.sin(this.pitch),
+      this.radius * cosPitch * Math.cos(this.yaw)
+    );
+
+    this.camera.up.set(0, cosPitch < 0 ? -1 : 1, 0);
+    this.camera.position.copy(this.target).add(offset);
+    this.camera.lookAt(this.target);
+  }
+
+  update() {
+    return false;
+  }
+
+  handleResize() {}
+}
+
 const elements = {
   homeView: document.querySelector('#homeView'),
   editorView: document.querySelector('#editorView'),
+  leftPanels: document.querySelector('.left-panels'),
+  creaturePanels: document.querySelector('.creature-panels'),
+  rightPanels: document.querySelector('.right-panels'),
   newProjectButton: document.querySelector('#newProjectButton'),
   openProjectButton: document.querySelector('#openProjectButton'),
   emptyNewProjectButton: document.querySelector('#emptyNewProjectButton'),
@@ -187,8 +422,15 @@ const elements = {
   projectsPath: document.querySelector('#projectsPath'),
   editorProjectName: document.querySelector('#editorProjectName'),
   editorSaveState: document.querySelector('#editorSaveState'),
+  projectViewportTab: document.querySelector('#projectViewportTab'),
+  creatureViewportTab: document.querySelector('#creatureViewportTab'),
+  newCreatureTabButton: document.querySelector('#newCreatureTabButton'),
+  viewport3dStage: document.querySelector('#viewport3dStage'),
+  creatureViewportStage: document.querySelector('#creatureViewportStage'),
+  viewportProjectTabName: document.querySelector('#viewportProjectTabName'),
   viewportProjectLabel: document.querySelector('#viewportProjectLabel'),
   sceneViewport: document.querySelector('#sceneViewport'),
+  creatureViewport: document.querySelector('#creatureViewport'),
   snackbar: document.querySelector('#snackbar'),
   newProjectModal: document.querySelector('#newProjectModal'),
   newProjectForm: document.querySelector('#newProjectForm'),
@@ -830,6 +1072,45 @@ function showMessage(message) {
   }, 3200);
 }
 
+function resizeEditorViewports() {
+  resizeViewport();
+  resizeCreatureViewport();
+}
+
+function setEditorTab(tabName) {
+  if (tabName === 'creature') {
+    state.creatureTabCreated = true;
+  }
+
+  state.activeEditorTab = tabName === 'creature' ? 'creature' : 'project';
+  const isCreatureTab = state.activeEditorTab === 'creature';
+
+  elements.editorView.classList.toggle('creature-editor-active', isCreatureTab);
+  elements.projectViewportTab.classList.toggle('viewport-tab-active', !isCreatureTab);
+  elements.projectViewportTab.setAttribute('aria-selected', String(!isCreatureTab));
+  elements.creatureViewportTab.hidden = !state.creatureTabCreated;
+  elements.creatureViewportTab.classList.toggle('viewport-tab-active', isCreatureTab);
+  elements.creatureViewportTab.setAttribute('aria-selected', String(isCreatureTab));
+  elements.viewport3dStage.hidden = isCreatureTab;
+  elements.creatureViewportStage.hidden = !isCreatureTab;
+  elements.creaturePanels.hidden = !isCreatureTab;
+  updatePanelToolButtons();
+
+  window.requestAnimationFrame(() => {
+    if (isCreatureTab) {
+      initCreatureViewport();
+      resizeCreatureViewport();
+      return;
+    }
+
+    resizeViewport();
+  });
+}
+
+function openCreatureTab() {
+  setEditorTab('creature');
+}
+
 function setView(view) {
   state.view = view;
   elements.homeView.hidden = view !== 'home';
@@ -838,7 +1119,10 @@ function setView(view) {
   if (view === 'editor') {
     window.requestAnimationFrame(() => {
       initViewport();
-      resizeViewport();
+      if (state.activeEditorTab === 'creature') {
+        initCreatureViewport();
+      }
+      resizeEditorViewports();
     });
   }
 }
@@ -1007,16 +1291,22 @@ function redoEditorAction() {
 
 function setActiveProject(project, options = {}) {
   const shouldResetHistory = options.resetHistory !== false;
+  const shouldPreserveEditorTabs = options.resetHistory === false;
+  const previousEditorTab = state.activeEditorTab;
+  const previousCreatureTabCreated = state.creatureTabCreated;
   clearBucketPreview();
   disposeTextureCache();
   state.activeProject = normalizeProject(project);
   state.activeTilesetId = defaultTilesetId;
   state.pendingTilesetImportId = null;
+  state.creatureTabCreated = shouldPreserveEditorTabs ? previousCreatureTabCreated : false;
   state.expandedGroupIds = new Set(getSceneGroups().map((group) => group.id));
   setSelectedObjects(['scene-light']);
   elements.editorProjectName.textContent = state.activeProject.name;
+  elements.viewportProjectTabName.textContent = state.activeProject.name;
   elements.viewportProjectLabel.textContent = state.activeProject.description || 'Cena 3D inicial sem objeto.';
   elements.editorSaveState.textContent = 'Salvo';
+  setEditorTab(shouldPreserveEditorTabs && previousCreatureTabCreated ? previousEditorTab : 'project');
   renderObjectTree();
   renderPropertiesPanel();
   renderTileStylePanel();
@@ -6055,12 +6345,26 @@ function updateTileMeshGeometry(mesh, sceneObject, metrics) {
 
   const previousGeometry = mesh.geometry;
   removeTileSelectionOutline(mesh);
-  mesh.geometry = createTileRenderGeometry(sceneObject, metrics);
+  mesh.geometry = getCachedTileRenderGeometry(sceneObject, metrics, geometryKey);
   mesh.userData.geometryKey = geometryKey;
 
-  if (previousGeometry) {
+  if (previousGeometry && !previousGeometry.userData?.engineFlatCachedGeometry) {
     previousGeometry.dispose();
   }
+}
+
+function getCachedTileRenderGeometry(sceneObject, metrics, geometryKey = getTileGeometryKey(sceneObject, metrics)) {
+  const cachedGeometry = viewport.geometryCache.get(geometryKey);
+
+  if (cachedGeometry) {
+    return cachedGeometry;
+  }
+
+  const geometry = createTileRenderGeometry(sceneObject, metrics);
+  geometry.userData.engineFlatCachedGeometry = true;
+  viewport.geometryCache.set(geometryKey, geometry);
+
+  return geometry;
 }
 
 function getTileMeshMaterialKey(sceneObject) {
@@ -6091,12 +6395,30 @@ function updateTileMeshMaterial(mesh, sceneObject) {
   }
 
   const previousMaterial = mesh.material;
-  mesh.material = createSceneObjectRenderMaterial(sceneObject);
+  mesh.material = getTileRenderMaterial(sceneObject, materialKey);
   mesh.userData.materialKey = materialKey;
 
   if (previousMaterial) {
     disposeMaterial(previousMaterial);
   }
+}
+
+function getTileRenderMaterial(sceneObject, materialKey = getTileMeshMaterialKey(sceneObject)) {
+  if (hasObjectPaintTexture(sceneObject)) {
+    return createSceneObjectRenderMaterial(sceneObject);
+  }
+
+  const cachedMaterial = viewport.materialCache.get(materialKey);
+
+  if (cachedMaterial) {
+    return cachedMaterial;
+  }
+
+  const material = createSceneObjectRenderMaterial(sceneObject);
+  material.userData.engineFlatCachedMaterial = true;
+  viewport.materialCache.set(materialKey, material);
+
+  return material;
 }
 
 function updateTileMeshTransform(mesh, sceneObject, metrics) {
@@ -6125,12 +6447,14 @@ function updateTileMesh(mesh, sceneObject) {
 
 function createTileMesh(sceneObject) {
   const metrics = getTileRenderMetrics(sceneObject);
-  const geometry = createTileRenderGeometry(sceneObject, metrics);
-  const material = createSceneObjectRenderMaterial(sceneObject);
+  const geometryKey = getTileGeometryKey(sceneObject, metrics);
+  const materialKey = getTileMeshMaterialKey(sceneObject);
+  const geometry = getCachedTileRenderGeometry(sceneObject, metrics, geometryKey);
+  const material = getTileRenderMaterial(sceneObject, materialKey);
   const mesh = new THREE.Mesh(geometry, material);
 
-  mesh.userData.geometryKey = getTileGeometryKey(sceneObject, metrics);
-  mesh.userData.materialKey = getTileMeshMaterialKey(sceneObject);
+  mesh.userData.geometryKey = geometryKey;
+  mesh.userData.materialKey = materialKey;
   updateTileMeshTransform(mesh, sceneObject, metrics);
 
   return mesh;
@@ -6520,11 +6844,15 @@ function applyViewportSelectionState() {
   });
 }
 
-function disposeMaterial(material) {
+function disposeMaterial(material, options = {}) {
   const materials = Array.isArray(material) ? material : [material];
 
   materials.forEach((item) => {
     if (!item) {
+      return;
+    }
+
+    if (item.userData?.engineFlatCachedMaterial && !options.force) {
       return;
     }
 
@@ -6538,7 +6866,7 @@ function disposeMaterial(material) {
 
 function disposeObjectTree(object) {
   object.traverse((child) => {
-    if (child.geometry) {
+    if (child.geometry && !child.geometry.userData?.engineFlatCachedGeometry) {
       child.geometry.dispose();
     }
 
@@ -6548,7 +6876,19 @@ function disposeObjectTree(object) {
   });
 }
 
+function invalidateViewportCachedResourceKeys() {
+  viewport.sceneObjectMeshes.forEach((mesh) => {
+    mesh.userData.geometryKey = null;
+    mesh.userData.materialKey = null;
+  });
+}
+
 function disposeTextureCache() {
+  invalidateViewportCachedResourceKeys();
+  viewport.geometryCache.forEach((geometry) => geometry.dispose());
+  viewport.geometryCache.clear();
+  viewport.materialCache.forEach((material) => disposeMaterial(material, { force: true }));
+  viewport.materialCache.clear();
   viewport.textureCache.forEach((texture) => texture.dispose());
   viewport.textureCache.clear();
   viewport.paintTextureCache.forEach((texture) => texture.dispose());
@@ -9746,11 +10086,9 @@ function initViewport() {
   scene.add(objectGroup);
   camera.position.set(7, 5, 7);
 
-  const controls = new TrackballControls(camera, canvas);
-  controls.staticMoving = false;
-  controls.dynamicDampingFactor = 0.08;
-  controls.keys = [];
+  const controls = new StableOrbitControls(camera, canvas);
   controls.target.set(0, 0, 0);
+  controls.syncFromCamera();
   controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
   controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
   controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
@@ -9817,15 +10155,499 @@ function resizeViewport() {
   resizeAxisGizmo();
 }
 
+function createCreaturePlatform() {
+  const group = new THREE.Group();
+  const platformSurface = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.4, 2.55, 0.3, 96),
+    new THREE.MeshStandardMaterial({
+      color: getCssColor('--md-sys-color-surface-container-highest'),
+      roughness: 0.55,
+      metalness: 0.08
+    })
+  );
+  const platformRim = new THREE.Mesh(
+    new THREE.TorusGeometry(2.42, 0.08, 12, 96),
+    new THREE.MeshStandardMaterial({
+      color: getCssColor('--md-sys-color-primary'),
+      roughness: 0.42,
+      metalness: 0.12
+    })
+  );
+  const innerRing = new THREE.Mesh(
+    new THREE.TorusGeometry(1.78, 0.018, 8, 96),
+    new THREE.MeshStandardMaterial({
+      color: getCssColor('--md-sys-color-outline'),
+      roughness: 0.68
+    })
+  );
+  const outerRing = new THREE.Mesh(
+    new THREE.TorusGeometry(2.08, 0.014, 8, 96),
+    new THREE.MeshStandardMaterial({
+      color: getCssColor('--md-sys-color-outline-variant'),
+      roughness: 0.72
+    })
+  );
+
+  platformSurface.position.y = 0.15;
+  platformRim.position.y = 0.34;
+  platformRim.rotation.x = Math.PI / 2;
+  innerRing.position.y = 0.34;
+  innerRing.rotation.x = Math.PI / 2;
+  outerRing.position.y = 0.35;
+  outerRing.rotation.x = Math.PI / 2;
+  group.add(platformSurface, platformRim, innerRing, outerRing);
+
+  return group;
+}
+
+function createCreatureEnvironment(scene) {
+  const ground = new THREE.Mesh(
+    new THREE.CircleGeometry(8, 96),
+    new THREE.MeshStandardMaterial({
+      color: getCssColor('--md-sys-color-surface-container'),
+      roughness: 0.9
+    })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.01;
+  scene.add(ground);
+
+  const accentMaterial = new THREE.MeshStandardMaterial({
+    color: getCssColor('--md-sys-color-secondary-container'),
+    roughness: 0.85
+  });
+
+  [
+    [-4.8, -2.7, 0.42, 0.9],
+    [4.2, -3.6, 0.34, 0.72],
+    [-5.5, 2.8, 0.26, 0.58],
+    [5.1, 2.2, 0.3, 0.64]
+  ].forEach(([x, z, height, radius]) => {
+    const mound = new THREE.Mesh(new THREE.SphereGeometry(radius, 24, 12), accentMaterial);
+    mound.position.set(x, height * 0.22, z);
+    mound.scale.y = height;
+    scene.add(mound);
+  });
+
+  const platform = createCreaturePlatform();
+  scene.add(platform);
+
+  return platform;
+}
+
+const creatureBoneSpacing = 0.86;
+const creatureBoneLength = 1.06;
+const creatureBaseHeight = 1.62;
+const creatureMaxBones = 4;
+const creatureBodyRadius = 0.72;
+
+function createCreatureLimb(direction) {
+  const group = new THREE.Group();
+  const color = direction === 'up' ? 0xff3030 : 0xff3030;
+  const material = new THREE.MeshStandardMaterial({
+    color,
+    emissive: color,
+    emissiveIntensity: 0.18,
+    roughness: 0.48,
+    metalness: 0.06
+  });
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.34, 12), material);
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.13, 0.28, 24), material);
+
+  shaft.position.y = direction === 'up' ? 0.16 : -0.16;
+  head.position.y = direction === 'up' ? 0.46 : -0.46;
+  if (direction === 'down') {
+    head.rotation.x = Math.PI;
+  }
+
+  group.add(shaft, head);
+  group.userData.creatureArrowDirection = direction;
+  shaft.userData.creatureArrowDirection = direction;
+  head.userData.creatureArrowDirection = direction;
+  return group;
+}
+
+function createCreatureSkeletonSegment(offset, materials) {
+  const group = new THREE.Group();
+  const y = creatureBaseHeight + (offset * creatureBoneSpacing);
+
+  const bone = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, creatureBoneLength, 14), materials.bone);
+  bone.position.y = y;
+  bone.userData.creatureSkeleton = true;
+
+  const topJoint = new THREE.Mesh(new THREE.SphereGeometry(0.075, 18, 12), materials.joint);
+  const bottomJoint = topJoint.clone();
+  topJoint.position.y = y + (creatureBoneLength / 2);
+  bottomJoint.position.y = y - (creatureBoneLength / 2);
+  topJoint.userData.creatureSkeleton = true;
+  bottomJoint.userData.creatureSkeleton = true;
+
+  group.add(bone, topJoint, bottomJoint);
+  return group;
+}
+
+function createCreatureBodyMesh(sortedOffsets, material) {
+  const minOffset = Math.min(...sortedOffsets);
+  const maxOffset = Math.max(...sortedOffsets);
+  const minY = creatureBaseHeight + (minOffset * creatureBoneSpacing);
+  const maxY = creatureBaseHeight + (maxOffset * creatureBoneSpacing);
+  const bodyLength = Math.max(0.001, maxY - minY);
+  const geometry = new THREE.CapsuleGeometry(creatureBodyRadius, bodyLength, 18, 48);
+  const mesh = new THREE.Mesh(geometry, material);
+
+  mesh.position.y = (minY + maxY) / 2;
+  mesh.scale.set(1.03, 0.92, 1.03);
+  mesh.userData.creatureBody = true;
+  return mesh;
+}
+
+function updateCreatureHandleVisibility() {
+  const shouldShow = creatureViewport.hoveredCreature || Boolean(creatureViewport.arrowDrag);
+
+  if (creatureViewport.skeletonGroup) {
+    creatureViewport.skeletonGroup.visible = shouldShow;
+  }
+
+  creatureViewport.bodyMeshes.forEach((mesh) => {
+    if (mesh.material) {
+      mesh.material.opacity = shouldShow ? 0.58 : 0.9;
+    }
+  });
+
+  creatureViewport.arrowTargets.forEach((arrow) => {
+    const isHovered = arrow.userData.creatureArrowDirection === creatureViewport.hoveredArrowDirection;
+    arrow.visible = shouldShow || isHovered;
+    arrow.traverse((child) => {
+      if (child.material) {
+        child.material.opacity = isHovered ? 1 : 0.72;
+        child.material.transparent = true;
+      }
+    });
+  });
+}
+
+function rebuildCreatureBody() {
+  if (!creatureViewport.bodyGroup) {
+    return;
+  }
+
+  creatureViewport.bodyGroup.clear();
+  creatureViewport.bodyMeshes = [];
+  creatureViewport.arrowTargets = [];
+
+  const bodyMaterial = new THREE.MeshStandardMaterial({
+    color: 0x7fd6c5,
+    roughness: 0.74,
+    metalness: 0.04,
+    transparent: true,
+    opacity: 0.9
+  });
+  const boneMaterial = new THREE.MeshStandardMaterial({
+    color: 0x1a4dff,
+    emissive: 0x0b2fbd,
+    emissiveIntensity: 0.16,
+    roughness: 0.38
+  });
+  const jointMaterial = new THREE.MeshStandardMaterial({
+    color: 0x8fb0ff,
+    emissive: 0x1b4dff,
+    emissiveIntensity: 0.12,
+    roughness: 0.44
+  });
+
+  const skeletonGroup = new THREE.Group();
+  const sortedOffsets = [...creatureViewport.boneOffsets].sort((a, b) => a - b);
+  const bodyMesh = createCreatureBodyMesh(sortedOffsets, bodyMaterial);
+  creatureViewport.bodyGroup.add(bodyMesh);
+  creatureViewport.bodyMeshes.push(bodyMesh);
+
+  sortedOffsets.forEach((offset) => {
+    const segment = createCreatureSkeletonSegment(offset, {
+      bone: boneMaterial,
+      joint: jointMaterial
+    });
+    skeletonGroup.add(segment);
+  });
+
+  const connectorMaterial = new THREE.MeshStandardMaterial({
+    color: 0x244bd8,
+    emissive: 0x1434a8,
+    emissiveIntensity: 0.1,
+    roughness: 0.4
+  });
+
+  for (let index = 1; index < sortedOffsets.length; index += 1) {
+    const previous = sortedOffsets[index - 1];
+    const current = sortedOffsets[index];
+    if (current - previous !== 1) {
+      continue;
+    }
+
+    const connectorHeight = Math.max(0.08, creatureBoneSpacing - creatureBoneLength);
+    const connector = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.025, 0.025, connectorHeight, 10),
+      connectorMaterial
+    );
+    connector.position.y = creatureBaseHeight + ((previous + current) * 0.5 * creatureBoneSpacing);
+    connector.userData.creatureSkeleton = true;
+    skeletonGroup.add(connector);
+  }
+
+  creatureViewport.skeletonGroup = skeletonGroup;
+  creatureViewport.bodyGroup.add(skeletonGroup);
+
+  const minOffset = Math.min(...sortedOffsets);
+  const maxOffset = Math.max(...sortedOffsets);
+  const upArrow = createCreatureLimb('up');
+  const downArrow = createCreatureLimb('down');
+  upArrow.position.y = creatureBaseHeight + (maxOffset * creatureBoneSpacing) + 0.88;
+  downArrow.position.y = creatureBaseHeight + (minOffset * creatureBoneSpacing) - 0.88;
+  creatureViewport.bodyGroup.add(upArrow, downArrow);
+  creatureViewport.arrowTargets.push(upArrow, downArrow);
+
+  updateCreatureHandleVisibility();
+}
+
+function updateCreatureRayFromPointerEvent(event) {
+  const rect = elements.creatureViewport.getBoundingClientRect();
+  creatureViewport.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  creatureViewport.pointer.y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+  creatureViewport.raycaster.setFromCamera(creatureViewport.pointer, creatureViewport.camera);
+}
+
+function getCreatureArrowIntersection(event) {
+  updateCreatureRayFromPointerEvent(event);
+  const intersections = creatureViewport.raycaster.intersectObjects(creatureViewport.arrowTargets, true);
+  return intersections.find((intersection) => intersection.object.userData?.creatureArrowDirection) || null;
+}
+
+function updateCreatureHover(event) {
+  if (!creatureViewport.initialized || creatureViewport.arrowDrag) {
+    return;
+  }
+
+  updateCreatureRayFromPointerEvent(event);
+  const arrowIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.arrowTargets, true)
+    .find((intersection) => intersection.object.userData?.creatureArrowDirection);
+  const bodyIntersection = creatureViewport.raycaster.intersectObjects(creatureViewport.bodyMeshes, false)[0];
+
+  creatureViewport.hoveredArrowDirection = arrowIntersection?.object.userData.creatureArrowDirection || null;
+  creatureViewport.hoveredCreature = Boolean(arrowIntersection || bodyIntersection);
+  elements.creatureViewport.style.cursor = arrowIntersection ? 'ns-resize' : (bodyIntersection ? 'grab' : 'grab');
+  updateCreatureHandleVisibility();
+}
+
+function beginCreatureArrowDrag(event) {
+  const intersection = getCreatureArrowIntersection(event);
+  const direction = intersection?.object.userData?.creatureArrowDirection;
+
+  if (!direction) {
+    return false;
+  }
+
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  creatureViewport.arrowDrag = {
+    pointerId: event.pointerId,
+    direction,
+    startClientY: event.clientY
+  };
+  if (creatureViewport.controls) {
+    creatureViewport.controls.enabled = false;
+  }
+  elements.creatureViewport.setPointerCapture(event.pointerId);
+  updateCreatureHandleVisibility();
+  return true;
+}
+
+function updateCreatureArrowDrag(event) {
+  const drag = creatureViewport.arrowDrag;
+
+  if (!drag || drag.pointerId !== event.pointerId) {
+    return;
+  }
+
+  event.preventDefault();
+  const deltaY = event.clientY - drag.startClientY;
+  const passedThreshold = Math.abs(deltaY) > 34;
+
+  if (!passedThreshold) {
+    return;
+  }
+
+  const isExpanding = drag.direction === 'up' ? deltaY < 0 : deltaY > 0;
+
+  if (isExpanding) {
+    if (creatureViewport.boneOffsets.length >= creatureMaxBones) {
+      drag.startClientY = event.clientY;
+      return;
+    }
+
+    const nextOffset = drag.direction === 'up'
+      ? Math.max(...creatureViewport.boneOffsets) + 1
+      : Math.min(...creatureViewport.boneOffsets) - 1;
+    creatureViewport.boneOffsets.push(nextOffset);
+  } else {
+    if (creatureViewport.boneOffsets.length <= 1) {
+      drag.startClientY = event.clientY;
+      return;
+    }
+
+    const removedOffset = drag.direction === 'up'
+      ? Math.max(...creatureViewport.boneOffsets)
+      : Math.min(...creatureViewport.boneOffsets);
+    creatureViewport.boneOffsets = creatureViewport.boneOffsets.filter((offset) => offset !== removedOffset);
+  }
+
+  drag.startClientY = event.clientY;
+  rebuildCreatureBody();
+}
+
+function endCreatureArrowDrag(event) {
+  const drag = creatureViewport.arrowDrag;
+
+  if (!drag || drag.pointerId !== event.pointerId) {
+    return;
+  }
+
+  creatureViewport.arrowDrag = null;
+  if (elements.creatureViewport.hasPointerCapture(event.pointerId)) {
+    elements.creatureViewport.releasePointerCapture(event.pointerId);
+  }
+  if (creatureViewport.controls) {
+    creatureViewport.controls.enabled = true;
+  }
+  updateCreatureHover(event);
+}
+
+function initCreatureViewport() {
+  if (creatureViewport.initialized || !elements.creatureViewport) {
+    return;
+  }
+
+  const canvas = elements.creatureViewport;
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    canvas
+  });
+
+  scene.background = new THREE.Color(getCssColor('--md-sys-color-surface-container-high'));
+  scene.fog = new THREE.Fog(getCssColor('--md-sys-color-surface-container-high'), 9, 18);
+  camera.position.set(4.2, 3.1, 6.2);
+  camera.lookAt(0, 0.8, 0);
+
+  const controls = new StableOrbitControls(camera, canvas);
+  controls.target.set(0, 1.55, 0);
+  controls.minDistance = 3.2;
+  controls.maxDistance = 11.6;
+  controls.minPitch = -0.12;
+  controls.maxPitch = 1.28;
+  controls.rotateSpeed = 0.72;
+  controls.zoomSpeed = 0.88;
+  controls.noPan = true;
+  controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
+  controls.mouseButtons.RIGHT = null;
+  controls.syncFromCamera();
+
+  const platformGroup = createCreatureEnvironment(scene);
+  const bodyGroup = new THREE.Group();
+  scene.add(bodyGroup);
+  const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x202027, 1.15);
+  const keyLight = new THREE.DirectionalLight(0xffffff, 2);
+  const fillLight = new THREE.DirectionalLight(0xffffff, 0.45);
+  keyLight.position.set(3.2, 5.8, 4.4);
+  fillLight.position.set(-4, 2.4, -3);
+  scene.add(hemisphereLight, keyLight, fillLight);
+
+  creatureViewport.initialized = true;
+  creatureViewport.renderer = renderer;
+  creatureViewport.scene = scene;
+  creatureViewport.camera = camera;
+  creatureViewport.controls = controls;
+  creatureViewport.platformGroup = platformGroup;
+  creatureViewport.bodyGroup = bodyGroup;
+
+  rebuildCreatureBody();
+
+  canvas.addEventListener('pointerdown', beginCreatureArrowDrag, true);
+  canvas.addEventListener('pointermove', (event) => {
+    updateCreatureArrowDrag(event);
+    updateCreatureHover(event);
+  });
+  canvas.addEventListener('pointerup', endCreatureArrowDrag);
+  canvas.addEventListener('pointercancel', endCreatureArrowDrag);
+  canvas.addEventListener('pointerleave', (event) => {
+    if (creatureViewport.arrowDrag) {
+      return;
+    }
+    creatureViewport.hoveredCreature = false;
+    creatureViewport.hoveredArrowDirection = null;
+    elements.creatureViewport.style.cursor = 'grab';
+    updateCreatureHandleVisibility();
+  });
+
+  const renderFrame = () => {
+    creatureViewport.animationId = window.requestAnimationFrame(renderFrame);
+
+    if (state.activeEditorTab !== 'creature') {
+      return;
+    }
+
+    renderer.render(scene, camera);
+  };
+
+  resizeCreatureViewport();
+  renderFrame();
+}
+
+function resizeCreatureViewport() {
+  if (!creatureViewport.initialized || !elements.creatureViewport) {
+    return;
+  }
+
+  const { clientWidth, clientHeight } = elements.creatureViewport;
+  if (clientWidth === 0 || clientHeight === 0) {
+    return;
+  }
+
+  creatureViewport.camera.aspect = clientWidth / clientHeight;
+  creatureViewport.camera.updateProjectionMatrix();
+  creatureViewport.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  creatureViewport.renderer.setSize(clientWidth, clientHeight, false);
+}
+
 function setSidebarCollapsed(side, isCollapsed) {
-  const className = side === 'left' ? 'left-panels-collapsed' : 'right-panels-collapsed';
+  if (side === 'left') {
+    if (state.activeEditorTab === 'creature') {
+      state.creatureLeftPanelCollapsed = isCollapsed;
+      elements.editorView.classList.toggle('creature-left-panels-collapsed', isCollapsed);
+    } else {
+      state.projectLeftPanelCollapsed = isCollapsed;
+      elements.editorView.classList.toggle('left-panels-collapsed', isCollapsed);
+    }
+
+    updatePanelToolButtons();
+    window.requestAnimationFrame(resizeEditorViewports);
+    return;
+  }
+
+  const className = 'right-panels-collapsed';
   elements.editorView.classList.toggle(className, isCollapsed);
   updatePanelToolButtons();
-  window.requestAnimationFrame(resizeViewport);
+  window.requestAnimationFrame(resizeEditorViewports);
 }
 
 function isSidebarCollapsed(side) {
-  const className = side === 'left' ? 'left-panels-collapsed' : 'right-panels-collapsed';
+  if (side === 'left') {
+    return state.activeEditorTab === 'creature'
+      ? state.creatureLeftPanelCollapsed
+      : state.projectLeftPanelCollapsed;
+  }
+
+  const className = 'right-panels-collapsed';
   return elements.editorView.classList.contains(className);
 }
 
@@ -9841,8 +10663,8 @@ function updatePanelToolButton(button, isCollapsed, labels) {
 
 function updatePanelToolButtons() {
   updatePanelToolButton(elements.collapseLeftPanelsButton, isSidebarCollapsed('left'), {
-    hide: 'Minimizar propriedades',
-    show: 'Mostrar propriedades'
+    hide: 'Minimizar barra lateral',
+    show: 'Mostrar barra lateral'
   });
   updatePanelToolButton(elements.collapseRightPanelsButton, isSidebarCollapsed('right'), {
     hide: 'Minimizar painéis da cena',
@@ -10113,6 +10935,9 @@ elements.objectTree.addEventListener('keydown', (event) => {
   }
 });
 elements.openProjectButton.addEventListener('click', openProjectDialog);
+elements.projectViewportTab.addEventListener('click', () => setEditorTab('project'));
+elements.creatureViewportTab.addEventListener('click', () => setEditorTab('creature'));
+elements.newCreatureTabButton.addEventListener('click', openCreatureTab);
 elements.viewportSelectToolButton.addEventListener('click', () => setViewportTool('select'));
 elements.viewportMoveToolButton.addEventListener('click', () => setViewportTool('move'));
 elements.viewportRotateToolButton.addEventListener('click', () => setViewportTool('rotate'));
@@ -10155,9 +10980,19 @@ elements.showFolderButton.addEventListener('click', async () => {
   }
 });
 
+document.querySelectorAll('.creature-category-tab').forEach((button) => {
+  button.addEventListener('click', () => {
+    document.querySelectorAll('.creature-category-tab').forEach((item) => {
+      const isActive = item === button;
+      item.classList.toggle('creature-category-tab-active', isActive);
+      item.setAttribute('aria-selected', String(isActive));
+    });
+  });
+});
+
 window.engineFlat.onMenuAction(handleMenuAction);
 
-window.addEventListener('resize', resizeViewport);
+window.addEventListener('resize', resizeEditorViewports);
 
 document.addEventListener('click', (event) => {
   if (!event.target.closest('.project-card-menu') && !event.target.closest('.project-card-menu-button')) {

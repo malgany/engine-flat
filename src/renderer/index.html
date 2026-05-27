@@ -251,50 +251,105 @@
             </section>
           </aside>
 
-          <main class="viewport-panel" aria-label="Viewport 3D">
-            <canvas id="sceneViewport" aria-label="Cena 3D"></canvas>
-            <div class="viewport-tool-palette" aria-label="Ferramentas de transformação">
-              <button class="viewport-tool-button tool-active" id="viewportSelectToolButton" type="button" aria-label="Selecionar" title="Selecionar">
-                <svg class="icon" aria-hidden="true"><use href="#icon-select"></use></svg>
-              </button>
-              <button class="viewport-tool-button" id="viewportMoveToolButton" type="button" aria-label="Mover" title="Mover">
-                <svg class="icon" aria-hidden="true"><use href="#icon-move"></use></svg>
-              </button>
-              <button class="viewport-tool-button" id="viewportRotateToolButton" type="button" aria-label="Rotacionar" title="Rotacionar">
-                <svg class="icon" aria-hidden="true"><use href="#icon-rotate"></use></svg>
-              </button>
-              <button class="viewport-tool-button" id="viewportScaleToolButton" type="button" aria-label="Transformar dimensões" title="Transformar dimensões">
-                <svg class="icon" aria-hidden="true"><use href="#icon-scale"></use></svg>
-              </button>
-              <div class="viewport-tool-menu-item" id="viewportRoundToolItem">
-                <button class="viewport-tool-button" id="viewportRoundToolButton" type="button" aria-label="Arredondar bordas" title="Arredondar bordas" aria-haspopup="menu" aria-expanded="false">
-                  <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
-                </button>
-                <div class="viewport-tool-submenu" id="viewportRoundModeMenu" role="menu" aria-label="Modo de arredondamento">
-                  <button class="viewport-tool-menu-option" type="button" role="menuitemradio" data-rounding-mode="edge" aria-label="12 bordas" title="12 bordas" aria-checked="true">
-                    <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
-                    <span class="rounding-mode-badge">12</span>
-                  </button>
-                  <button class="viewport-tool-menu-option" type="button" role="menuitemradio" data-rounding-mode="axis" aria-label="Por eixo" title="Por eixo" aria-checked="false">
-                    <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
-                    <span class="rounding-mode-badge">3</span>
-                  </button>
-                  <button class="viewport-tool-menu-option" type="button" role="menuitemradio" data-rounding-mode="all" aria-label="Todas as bordas" title="Todas as bordas" aria-checked="false">
-                    <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
-                    <span class="rounding-mode-badge">1</span>
-                  </button>
-                </div>
+          <aside class="creature-panels" aria-label="Partes da criatura" hidden>
+            <section class="panel creature-parts-panel">
+              <div class="panel-header">
+                <h3>Criatura</h3>
+                <span>Partes</span>
               </div>
-              <button class="viewport-tool-button" id="viewportShapeToolButton" type="button" aria-label="Forma" title="Forma">
-                <svg class="icon" aria-hidden="true"><use href="#icon-taper-shape"></use></svg>
+              <div class="creature-category-tabs" role="tablist" aria-label="Categorias de partes">
+                <button class="creature-category-tab creature-category-tab-active" type="button" role="tab" aria-selected="true" title="Olhos">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-eye"></use></svg>
+                  <span>Olhos</span>
+                </button>
+                <button class="creature-category-tab" type="button" role="tab" aria-selected="false" title="Bocas">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-model"></use></svg>
+                  <span>Bocas</span>
+                </button>
+                <button class="creature-category-tab" type="button" role="tab" aria-selected="false" title="Membros">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-move"></use></svg>
+                  <span>Membros</span>
+                </button>
+                <button class="creature-category-tab" type="button" role="tab" aria-selected="false" title="Detalhes">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
+                  <span>Detalhes</span>
+                </button>
+              </div>
+              <div class="creature-parts-grid" aria-label="Partes disponíveis">
+                <button class="creature-part-tile" type="button"><span></span><strong>Olho simples</strong></button>
+                <button class="creature-part-tile" type="button"><span></span><strong>Olho duplo</strong></button>
+                <button class="creature-part-tile" type="button"><span></span><strong>Boca curva</strong></button>
+                <button class="creature-part-tile" type="button"><span></span><strong>Braço base</strong></button>
+                <button class="creature-part-tile" type="button"><span></span><strong>Perna base</strong></button>
+                <button class="creature-part-tile" type="button"><span></span><strong>Chifre</strong></button>
+              </div>
+            </section>
+          </aside>
+
+          <main class="viewport-panel" aria-label="Viewport 3D">
+            <div class="viewport-tabbar" role="tablist" aria-label="Visualizações do editor">
+              <button class="viewport-tab viewport-tab-active" id="projectViewportTab" type="button" role="tab" aria-selected="true" aria-controls="viewport3dStage">
+                <span id="viewportProjectTabName">Projeto sem título</span>
+              </button>
+              <button class="viewport-tab" id="creatureViewportTab" type="button" role="tab" aria-selected="false" aria-controls="creatureViewportStage" hidden>
+                <span>Criaturas</span>
+              </button>
+              <button class="viewport-new-tab-button" id="newCreatureTabButton" type="button" aria-label="Abrir aba de criaturas" title="Abrir aba de criaturas">
+                <svg class="icon" aria-hidden="true"><use href="#icon-add"></use></svg>
               </button>
             </div>
-            <div class="viewport-overlay">
-              <strong>Perspectiva do usuário</strong>
-              <span id="viewportProjectLabel">Cena 3D inicial sem objeto.</span>
+            <div class="viewport-stage" id="viewport3dStage" role="tabpanel" aria-label="Cena 3D">
+              <canvas id="sceneViewport" aria-label="Cena 3D"></canvas>
+              <div class="viewport-tool-palette" aria-label="Ferramentas de transformação">
+                <button class="viewport-tool-button tool-active" id="viewportSelectToolButton" type="button" aria-label="Selecionar" title="Selecionar">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-select"></use></svg>
+                </button>
+                <button class="viewport-tool-button" id="viewportMoveToolButton" type="button" aria-label="Mover" title="Mover">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-move"></use></svg>
+                </button>
+                <button class="viewport-tool-button" id="viewportRotateToolButton" type="button" aria-label="Rotacionar" title="Rotacionar">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-rotate"></use></svg>
+                </button>
+                <button class="viewport-tool-button" id="viewportScaleToolButton" type="button" aria-label="Transformar dimensões" title="Transformar dimensões">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-scale"></use></svg>
+                </button>
+                <div class="viewport-tool-menu-item" id="viewportRoundToolItem">
+                  <button class="viewport-tool-button" id="viewportRoundToolButton" type="button" aria-label="Arredondar bordas" title="Arredondar bordas" aria-haspopup="menu" aria-expanded="false">
+                    <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
+                  </button>
+                  <div class="viewport-tool-submenu" id="viewportRoundModeMenu" role="menu" aria-label="Modo de arredondamento">
+                    <button class="viewport-tool-menu-option" type="button" role="menuitemradio" data-rounding-mode="edge" aria-label="12 bordas" title="12 bordas" aria-checked="true">
+                      <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
+                      <span class="rounding-mode-badge">12</span>
+                    </button>
+                    <button class="viewport-tool-menu-option" type="button" role="menuitemradio" data-rounding-mode="axis" aria-label="Por eixo" title="Por eixo" aria-checked="false">
+                      <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
+                      <span class="rounding-mode-badge">3</span>
+                    </button>
+                    <button class="viewport-tool-menu-option" type="button" role="menuitemradio" data-rounding-mode="all" aria-label="Todas as bordas" title="Todas as bordas" aria-checked="false">
+                      <svg class="icon" aria-hidden="true"><use href="#icon-round-corner"></use></svg>
+                      <span class="rounding-mode-badge">1</span>
+                    </button>
+                  </div>
+                </div>
+                <button class="viewport-tool-button" id="viewportShapeToolButton" type="button" aria-label="Forma" title="Forma">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-taper-shape"></use></svg>
+                </button>
+              </div>
+              <div class="viewport-overlay">
+                <strong>Perspectiva do usuário</strong>
+                <span id="viewportProjectLabel">Cena 3D inicial sem objeto.</span>
+              </div>
+              <div class="axis-gizmo" id="axisGizmo" aria-label="Orientação da cena" role="application" tabindex="0">
+                <canvas id="axisGizmoCanvas" aria-hidden="true"></canvas>
+              </div>
             </div>
-            <div class="axis-gizmo" id="axisGizmo" aria-label="Orientação da cena" role="application" tabindex="0">
-              <canvas id="axisGizmoCanvas" aria-hidden="true"></canvas>
+            <div class="creature-viewport-stage" id="creatureViewportStage" role="tabpanel" aria-label="Criador de criaturas" hidden>
+              <canvas id="creatureViewport" aria-label="Ambiente 3D do criador de criaturas"></canvas>
+              <div class="creature-viewport-overlay">
+                <strong>Criador de criaturas</strong>
+                <span>Ambiente inicial para montagem.</span>
+              </div>
             </div>
           </main>
 
